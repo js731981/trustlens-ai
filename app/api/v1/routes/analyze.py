@@ -23,9 +23,16 @@ from app.models.analyze import (
 from app.prompts.registry import UnknownPromptTemplateError
 from app.services import analyze as analyze_service
 from app.services import financial_llm as financial_llm_service
+from app.services import rag_client
 from app.services.financial_llm import LLM_DEFLECTION_MARKER, build_financial_prompt
 from app.services.query_intent import classify_query
 from services.llm.prompt_builder import load_catalog_product_names
+from services.trust.accuracy_scorer import (
+    accuracy_score_vs_catalog,
+    compute_accuracy,
+    merged_provider_ranked_names,
+)
+from services.trust.ground_truth import load_ground_truth_for_query
 from services.trust.explainer import explain_trust
 from services.trust.ranking_comparator import compare_rankings
 from services.trust.trust_scorer import compute_trust_score
@@ -155,6 +162,36 @@ def _try_shape_analyze_response(
     )
 
 
+def _ground_truth_accuracy_and_trust(
+    query: str,
+    data_dir: Path,
+    results_for_compare: dict[str, Any],
+    metrics_full: dict[str, float] | None,
+) -> tuple[float | None, float | None]:
+    """Compare merged LLM rankings to ``ground_truth.json``; return accuracy and blended trust_score."""
+    gt = load_ground_truth_for_query(query, data_dir / "ground_truth.json")
+    if gt is None:
+        return None, None
+    predicted = merged_provider_ranked_names(results_for_compare)
+    acc = float(compute_accuracy(predicted, gt)["accuracy"])
+    if metrics_full is not None:
+        blended = dict(metrics_full)
+        blended["accuracy_score"] = acc
+        trust = float(compute_trust_score(blended)["trust_score"])
+    else:
+        trust = float(
+            compute_trust_score(
+                {
+                    "overlap_score": 1.0,
+                    "stability_score": 1.0,
+                    "rank_variance": 0.0,
+                    "accuracy_score": acc,
+                }
+            )["trust_score"]
+        )
+    return acc, trust
+
+
 def _shape_analyze_response(result: AnalyzeResponse, catalog_names: tuple[str, ...]) -> AnalyzeResponse:
     shaped = _try_shape_analyze_response(result, catalog_names)
     if isinstance(shaped, AnalyzeProviderError):
@@ -176,9 +213,23 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
         intent = classify_query(query)
         settings = get_settings()
         catalog_path = _ranking_catalog_path(intent, settings.data_dir)
-        catalog_names = load_catalog_product_names(catalog_path)
-        original_prompt = build_financial_prompt(query, catalog_product_names=catalog_names)
-        print("Final Prompt:", original_prompt)
+        rag_ctx = await rag_client.fetch_rag_context_for_query(query, settings)
+        if rag_ctx is not None:
+            catalog_names = rag_ctx.catalog_names
+            retrieved_docs = rag_ctx.retrieved_documents
+            logger.debug("analyze_catalog_source", extra={"source": "rag", "n": len(catalog_names)})
+        else:
+            catalog_names = load_catalog_product_names(catalog_path)
+            retrieved_docs = None
+            logger.debug(
+                "analyze_catalog_source",
+                extra={"source": "static_file", "path": str(catalog_path)},
+            )
+        original_prompt = build_financial_prompt(
+            query,
+            catalog_product_names=catalog_names,
+            retrieved_documents=retrieved_docs,
+        )
         result = await analyze_service.run_analyze(
             query,
             provider=body.provider,
@@ -213,7 +264,11 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
                 else:
                     results_for_compare[key] = entry.parsed_output or {}
             metrics_full = compare_rankings(results_for_compare)
+            metrics_full["accuracy_score"] = accuracy_score_vs_catalog(results_for_compare, catalog_names)
             trust_raw = compute_trust_score(metrics_full)
+            gt_accuracy, gt_trust_score = _ground_truth_accuracy_and_trust(
+                query, settings.data_dir, results_for_compare, metrics_full
+            )
             explained = explain_trust(metrics_full, trust_raw)
             providers_used = _providers_in_order(shaped.keys())
             debug_by_provider: dict[ProviderName, AnalyzeApiDebug] = {
@@ -240,16 +295,26 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
                 metrics=AnalyzeApiMetrics(
                     overlap_score=float(metrics_full["overlap_score"]),
                     stability_score=float(metrics_full["stability_score"]),
+                    rank_variance=float(metrics_full["rank_variance"]),
+                    accuracy_score=float(metrics_full["accuracy_score"]),
                 ),
                 trust=AnalyzeApiTrust(
                     score=float(trust_raw["trust_score"]),
                     confidence=trust_raw["confidence_level"],
+                    stability_score=float(trust_raw["stability_score"]),
+                    accuracy_score=float(trust_raw["accuracy_score"]),
+                    overlap_score=float(trust_raw["overlap_score"]),
+                    stability_component=float(trust_raw["stability_component"]),
+                    accuracy_component=float(trust_raw["accuracy_component"]),
+                    overlap_component=float(trust_raw["overlap_component"]),
                 ),
                 explanation=AnalyzeApiExplanation(
                     summary=explained["summary"],
                     insights=list(explained["insights"]),
                 ),
                 debug=debug_payload,
+                accuracy=gt_accuracy,
+                trust_score=gt_trust_score,
             )
         try_first = _try_shape_analyze_response(result, catalog_names)
         if isinstance(try_first, AnalyzeProviderError):
@@ -265,6 +330,10 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
             catalog_names,
         )
         p = shaped_one.provider_used
+        results_one = {p: shaped_one.parsed_output}
+        gt_accuracy, gt_trust_score = _ground_truth_accuracy_and_trust(
+            query, settings.data_dir, results_one, None
+        )
         return AnalyzeApiResponse(
             query=query,
             providers_used=[p],
@@ -273,6 +342,8 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
             trust=None,
             explanation=_explanation_single(shaped_one.parsed_output),
             debug=_debug_for_result(shaped_one, repair_applied),
+            accuracy=gt_accuracy,
+            trust_score=gt_trust_score,
         )
     except UnknownPromptTemplateError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

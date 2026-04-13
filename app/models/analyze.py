@@ -101,13 +101,25 @@ class AnalyzeApiMetrics(BaseModel):
 
     overlap_score: float = Field(ge=0.0, le=1.0)
     stability_score: float = Field(ge=0.0, le=1.0)
+    rank_variance: float = Field(ge=0.0, description="Mean variance of rank for products listed by multiple providers.")
+    accuracy_score: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Catalog alignment: recall of a catalog sample against merged provider rankings.",
+    )
 
 
 class AnalyzeApiTrust(BaseModel):
-    """Aggregate trust from provider agreement (present when multiple providers are compared)."""
+    """Aggregate trust from stability, catalog accuracy, and overlap (present when multiple providers are compared)."""
 
     score: float = Field(ge=0.0, le=1.0)
     confidence: Literal["low", "medium", "high"]
+    stability_score: float = Field(ge=0.0, le=1.0)
+    accuracy_score: float = Field(ge=0.0, le=1.0)
+    overlap_score: float = Field(ge=0.0, le=1.0)
+    stability_component: float = Field(ge=0.0, le=1.0, description="0.4 × stability_score (pre-sum contribution).")
+    accuracy_component: float = Field(ge=0.0, le=1.0, description="0.4 × accuracy_score (pre-sum contribution).")
+    overlap_component: float = Field(ge=0.0, le=1.0, description="0.2 × overlap_score (pre-sum contribution).")
 
 
 class AnalyzeApiExplanation(BaseModel):
@@ -150,6 +162,18 @@ class AnalyzeApiResponse(BaseModel):
     explanation: AnalyzeApiExplanation
     debug: AnalyzeApiDebug | dict[ProviderName, AnalyzeApiDebug] = Field(
         description="Single-provider: one object. Multi-provider: map of provider name to the same fields.",
+    )
+    accuracy: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Multiset recall of model-ranked names vs labeled ground truth for this query (when available).",
+    )
+    trust_score: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Aggregate trust using stability/overlap from ranking comparison and ground-truth accuracy when set.",
     )
 
 

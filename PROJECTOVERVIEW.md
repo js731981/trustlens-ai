@@ -16,14 +16,17 @@ flowchart LR
     HTTP[HTTP clients / OpenAPI]
     ST[Streamlit app]
   end
-  subgraph api [FastAPI app]
+  subgraph api [FastAPI main app]
     RAnalyze["/v1/analyze"]
     RFin["/v1/financial/*"]
     RInsights["/v1/insights/explanation"]
     RHealth["/v1/health"]
+    RIndex["POST /index"]
+    RSearch["POST /search"]
   end
   subgraph core [Core services]
     Intent[query_intent]
+    RagClient[rag_client optional]
     Prompt[build_financial_prompt]
     LLMRun[financial_llm.query_financial_llm_multi]
     Parse[normalizer / parser / validator]
@@ -39,17 +42,26 @@ flowchart LR
   subgraph data [Data]
     SQLite[(SQLite trust_lens.db)]
     Catalog[JSON catalogs]
+    QdrantAPI[(Qdrant in-process)]
+  end
+  subgraph ragopt [Optional RAG microservice]
+    RagSvc[rag-service POST /search]
   end
   HTTP --> RAnalyze
   ST --> RAnalyze
   RAnalyze --> Intent
+  RAnalyze --> RagClient
+  RagClient -.->|HTTP| RagSvc
+  RagClient --> Prompt
+  Catalog --> Prompt
   RAnalyze --> Prompt
   RAnalyze --> LLMRun
   LLMRun --> Ollama
   LLMRun --> OpenAI
   LLMRun --> OpenRouter
   LLMRun --> SQLite
-  Prompt --> Catalog
+  RIndex --> QdrantAPI
+  RSearch --> QdrantAPI
   RAnalyze --> Parse
   RAnalyze --> Compare
   Compare --> Trust
@@ -62,12 +74,17 @@ flowchart LR
 
 | Path | Role |
 |------|------|
-| `app/main.py` | FastAPI factory, lifespan (initializes SQLite), mounts `/v1` router. |
+| `app/main.py` | FastAPI factory, lifespan (initializes SQLite), mounts `/v1` router **and** root routers for `indexing` and `search` (no `/v1` prefix). |
 | `app/api/v1/router.py` | Registers route modules: `health`, `analyze`, `financial`, `insights`. |
-| `app/api/v1/routes/analyze.py` | Main orchestration: intent, catalog load, prompt build, multi/single provider run, parse/retry, trust aggregation. |
+| `app/api/v1/routes/analyze.py` | Main orchestration: intent, optional RAG catalog (`rag_client`), else static catalog; prompt build; multi/single provider run; parse/retry; trust, accuracy vs ground truth when available. |
+| `app/api/v1/routes/indexing.py` | `POST /index` — embed insurance + loan JSON from `data_dir` and upsert into Qdrant (`financial_products`). |
+| `app/api/v1/routes/search.py` | `POST /search` — query embedding + Qdrant vector search (`top_k`). |
 | `app/api/v1/routes/financial.py` | `financial/query` and `financial/recommendation-bias`. |
 | `app/api/v1/routes/insights.py` | `insights/explanation` — CPU-bound NLP in a thread. |
 | `app/api/v1/routes/health.py` | Simple health payload with version. |
+| `app/services/rag_client.py` | Async `fetch_rag_context_for_query`: `POST {RAG_SERVICE_BASE_URL}/search` with `{query, limit}`; builds deduped catalog names and hit payloads for the prompt. |
+| `app/services/embedding_service.py` | Sentence-transformers embeddings for `/index` and `/search`. |
+| `app/services/qdrant_service.py` | Qdrant client (`QDRANT_HOST` / `QDRANT_PORT`), collection `financial_products`. |
 | `app/core/config.py` | Pydantic settings from environment (including `ENV=DEV` mock mode). |
 | `app/core/logging.py` | Logging setup used across services. |
 | `app/services/analyze.py` | `run_analyze`: `"all"` runs three providers concurrently; non-Ollama requests **fall back to Ollama** on configuration or upstream errors. |
@@ -85,30 +102,39 @@ flowchart LR
 | `services/utils/` | JSON extraction, normalization, catalog validation, query classification helpers. |
 | `data/insurance_products.json`, `data/loan_providers.json` | Catalogs whose **names** are injected into prompts and used to validate returned products. |
 | `streamlit_app.py` | Calls `POST /v1/analyze` with a single provider; displays metrics when the API returns multi-provider results (the select box does not expose `"all"`; you can still call the API with `"all"` from curl or OpenAPI). |
+| `rag-service/` | Standalone FastAPI app: loads embeddings + Qdrant on startup; exposes `POST /index`, `POST /search`, `GET /health`. Intended as the HTTP target for `RAG_SERVICE_BASE_URL` when you want analyze to use retrieval instead of only static JSON names. |
 
 ## Request flow: `POST /v1/analyze`
 
 1. **Intent** — `classify_query` scores simple keyword lists → `"insurance"` (default) or `"loan"`.
-2. **Catalog** — `load_catalog_product_names` reads the matching JSON under `settings.data_dir` (default `./data`).
-3. **Prompt** — `build_financial_prompt` renders `financial_ranking` templates and embeds the formatted product list.
+2. **Catalog source** — `rag_client.fetch_rag_context_for_query` calls the optional RAG service. On success, **catalog names and retrieved hit payloads** drive validation and prompt context. On failure or empty labels, **`load_catalog_product_names`** reads the matching JSON under `settings.data_dir` (default `./data`).
+3. **Prompt** — `build_financial_prompt` renders `financial_ranking` templates with the chosen catalog (and optional retrieved snippets).
 4. **LLM execution** — `run_analyze` in `app/services/analyze.py`:
    - `provider="all"`: parallel calls to Ollama, OpenAI, OpenRouter; failures become `AnalyzeProviderError` entries rather than failing the whole request.
    - Single provider: OpenAI/OpenRouter may **fall back to Ollama** if the primary call raises configuration or upstream errors.
 5. **Shaping** — Raw text is checked for a deflection marker (`LLM_DEFLECTION_MARKER`); JSON is parsed, normalized, and **validated against catalog names**.
 6. **Empty ranking retry** — If `ranked_products` is empty after parse, one retry with a strict JSON prefix is attempted per provider.
-7. **Multi-provider branch** — `compare_rankings` → `compute_trust_score` → `explain_trust`; response includes `metrics`, `trust`, and a narrative `explanation`.
-8. **Single-provider branch** — Returns simplified `explanation` and `debug` without cross-model metrics.
+7. **Multi-provider branch** — `compare_rankings` → `accuracy_score_vs_catalog` merged into metrics → `compute_trust_score` → `explain_trust`; optional `_ground_truth_accuracy_and_trust` enriches the API `accuracy` / `trust_score` fields when ground-truth files exist for the query. Response includes `metrics`, `trust`, and a narrative `explanation`.
+8. **Single-provider branch** — Returns simplified `explanation` and `debug` without cross-model `metrics` / `trust`; may still include **`accuracy`** and **`trust_score`** when ground-truth scoring applies.
 
 ## Trust and comparison metrics
 
 - **`services/trust/ranking_comparator.py`** — `compare_rankings` builds per-provider rank maps (normalized names), then emits scores such as **`overlap_score`**, **`rank_variance`**, and **`stability_score`** (see implementation for exact definitions on the union of products).
-- **`services/trust/trust_scorer.py`** — `compute_trust_score` blends overlap, stability, and rank variance:
+- **`services/trust/accuracy_scorer.py`** — `accuracy_score_vs_catalog` measures how well merged provider rankings cover a catalog-derived sample; injected into comparison metrics before trust aggregation.
+- **`services/trust/trust_scorer.py`** — `compute_trust_score` blends stability, catalog alignment accuracy, and overlap:
 
-  `raw = 0.5 * stability + 0.3 * overlap - 0.2 * rank_variance`, clamped to `[0, 1]`.
+  `trust_score = clamp(0.4 * stability_score + 0.4 * accuracy_score + 0.2 * overlap_score, 0, 1)`
+
+  If **`accuracy_score`** is omitted from the input dict, it defaults to **`1.0`** so legacy callers that only pass ranking metrics are not over-penalized. **`rank_variance`** is passed through for explanations and API metrics; it does **not** appear in this aggregate formula.
 
   **Confidence** labels: `high` (≥ 0.7), `medium` (≥ 0.4), else `low`.
 
 - **`services/trust/explainer.py`** — Produces human-readable summary and bullet insights from the metric dict (used in the API `explanation` block for multi-provider runs).
+
+## Vector search vs RAG microservice
+
+- **In-process (main API)** — `POST /index` and `POST /search` live on the **same** FastAPI app as `/v1/*` but are mounted **without** the `/v1` prefix. They use `sentence-transformers` + `qdrant-client` against Qdrant at `QDRANT_HOST`:`QDRANT_PORT`, collection **`financial_products`**. This path is useful for local demos and for keeping retrieval colocated with the ranking API.
+- **Optional `rag-service/`** — Separate deployable with its own Qdrant wiring (`rag-service/.env`). The main app’s **`RAG_SERVICE_BASE_URL`** points here; **`rag_client`** expects a JSON body `{ "query", "limit" }` and a response whose **`hits`** list supplies `text` / `metadata` for catalog labels and prompt context. If the call fails, analyze **falls back** to static JSON catalogs.
 
 ## LLM providers and configuration
 
@@ -156,8 +182,11 @@ First download of these models can take time and disk space.
 - **Web**: FastAPI, Uvicorn, Pydantic v2, pydantic-settings  
 - **HTTP / resilience**: httpx, requests, tenacity  
 - **Config**: python-dotenv  
-- **ML / NLP**: torch, transformers (version range `<5`)  
+- **ML / NLP**: torch, transformers (version range `<5`), **sentence-transformers** (embeddings for `/index` and `/search`)  
+- **Vector**: **qdrant-client** (main app Qdrant integration)  
 - **UI**: streamlit, plotly  
+
+The **`rag-service/`** directory has its own dependency file for its FastAPI + Qdrant stack.
 
 ## Operational notes
 
@@ -168,7 +197,8 @@ First download of these models can take time and disk space.
 
 ## Extension ideas (not implemented here)
 
-- Wire `record_analyze_run` from `analyze` (or a background task) so `/history` reflects full analyze snapshots and drift.
+- Wire `record_analyze_run` from `analyze` (or a background task) so `/v1/history` reflects full analyze snapshots and drift consistently with `llm_responses`.
 - Add authentication and rate limiting on `/v1/analyze`.
 - Train `TrustScoreMLP` on labeled data and optionally replace or blend with `compute_trust_score`.
 - Expand catalogs and intent routing beyond insurance vs loan keywords.
+- Unify retrieval: single Qdrant deployment shared by main `/search` and `rag-service`, or consolidate so only one embedding stack is required in production.

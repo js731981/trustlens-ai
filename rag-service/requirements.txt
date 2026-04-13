@@ -1,0 +1,10 @@
+# RAG microservice
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+pydantic==2.11.3
+pydantic-settings==2.8.1
+python-dotenv==1.1.0
+
+# Vector store & embeddings
+qdrant-client==1.12.1
+sentence-transformers==3.3.1

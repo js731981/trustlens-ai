@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from typing import Any, Final
 from uuid import uuid4
 
@@ -19,7 +20,11 @@ from app.models.financial import FinancialQueryResponse
 from app.prompts.registry import render_prompt
 from app.services import tracking_store
 from services.llm.factory import get_llm
-from services.llm.prompt_builder import format_available_products_block
+from services.llm.prompt_builder import (
+    documents_from_product_names,
+    format_top_results_block,
+    insurance_catalog_product_names,
+)
 from services.utils.parser import parse_llm_json
 
 logger = get_logger(__name__)
@@ -107,10 +112,21 @@ def build_financial_prompt(
     template_id: str = "financial_ranking",
     *,
     catalog_product_names: tuple[str, ...] | None = None,
+    retrieved_documents: Iterable[dict[str, Any]] | None = None,
 ) -> str:
     variables: dict[str, str] = {"user_query": user_query}
     if template_id == "financial_ranking":
-        variables["available_products"] = format_available_products_block(catalog_product_names)
+        if retrieved_documents is not None:
+            docs = [d for d in retrieved_documents if isinstance(d, dict)]
+            variables["top_results"] = format_top_results_block(docs)
+        elif catalog_product_names is not None:
+            variables["top_results"] = format_top_results_block(
+                documents_from_product_names(catalog_product_names),
+            )
+        else:
+            variables["top_results"] = format_top_results_block(
+                documents_from_product_names(insurance_catalog_product_names()),
+            )
     system_prompt, user_prompt = render_prompt(template_id, variables)
     return f"{system_prompt}\n\n{user_prompt}".strip()
 

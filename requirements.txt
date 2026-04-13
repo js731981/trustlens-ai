@@ -13,6 +13,10 @@ tenacity==9.1.2
 # ML — TrustScoreMLP / training (`app/ml`) + HF pipelines (`app/services/explanation_insights.py`)
 torch>=2.2.0
 transformers>=4.45.0,<5
+sentence-transformers>=3.0.0,<4
+
+# Vector store (financial_products RAG / retrieval)
+qdrant-client>=1.12.0,<2
 
 # Streamlit demo (`streamlit_app.py`)
 streamlit>=1.39.0

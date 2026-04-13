@@ -42,6 +42,12 @@ def explain_trust(metrics: dict[str, Any], trust: dict[str, Any] | Any) -> Trust
     rank_variance = _coerce_float(metrics.get("rank_variance"))
     trust_score = _trust_score_value(trust)
     level = _confidence_level(trust)
+    if isinstance(trust, dict) and "accuracy_score" in trust:
+        accuracy_value = _coerce_float(trust.get("accuracy_score"))
+    elif "accuracy_score" in metrics:
+        accuracy_value = _coerce_float(metrics.get("accuracy_score"))
+    else:
+        accuracy_value = None
 
     overlap_high = overlap >= 0.65
     overlap_low = overlap < 0.35
@@ -130,5 +136,22 @@ def explain_trust(metrics: dict[str, Any], trust: dict[str, Any] | Any) -> Trust
 
     summary = summary_lead + summary_close
     insights = [overlap_insight, variance_insight]
+    if accuracy_value is not None:
+        if accuracy_value >= 0.75:
+            acc_insight = (
+                f"Catalog alignment is strong ({accuracy_value:.0%} of the catalog sample is reflected "
+                "in model rankings), which supports factual grounding."
+            )
+        elif accuracy_value >= 0.4:
+            acc_insight = (
+                f"Catalog alignment is moderate ({accuracy_value:.0%}); some catalog references may be "
+                "missing from or reshuffled across model outputs."
+            )
+        else:
+            acc_insight = (
+                f"Catalog alignment is weak ({accuracy_value:.0%}), so names in rankings may drift from "
+                "the supplied product list—verify picks against the catalog."
+            )
+        insights.append(acc_insight)
 
     return {"summary": summary, "insights": insights}

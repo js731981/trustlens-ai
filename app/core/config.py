@@ -43,6 +43,23 @@ class Settings(BaseSettings):
         description="Directory for SQLite tracking DB and persisted analytics.",
     )
 
+    rag_service_base_url: str = Field(
+        default="http://localhost:8002",
+        validation_alias="RAG_SERVICE_BASE_URL",
+        description="RAG microservice base URL (POST {base}/search for retrieval-augmented ranking).",
+    )
+    rag_search_top_k: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        validation_alias="RAG_SEARCH_TOP_K",
+    )
+    rag_service_timeout_seconds: float = Field(
+        default=10.0,
+        ge=0.5,
+        validation_alias="RAG_SERVICE_TIMEOUT_SECONDS",
+    )
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

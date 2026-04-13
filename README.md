@@ -1,5 +1,5 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Python](https://img.shields.io/badge/python-3.10+-green)
+![Python](https://img.shields.io/badge/python-3.11+-green)
 ![FastAPI](https://img.shields.io/badge/backend-FastAPI-teal)
 ![LLM](https://img.shields.io/badge/LLM-Ollama%20%7C%20OpenAI-orange)
 ![Status](https://img.shields.io/badge/status-MVP-brightgreen)
@@ -7,16 +7,17 @@
 
 # Trust Lens AI
 
-Trust Lens is a **FastAPI** service that asks large language models (LLMs) to rank financial products from a fixed catalog, then **parses, validates, and scores** those answers. You can run a single provider (Ollama, OpenAI, or OpenRouter) or compare all three in parallel to get **overlap**, **stability**, and an aggregate **trust score** with a short explanation.
+Trust Lens is a **FastAPI** service that asks large language models (LLMs) to rank financial products from a **catalog** (static JSON files and/or **retrieval** from an optional RAG microservice), then **parses, validates, and scores** those answers. You can run a single provider (Ollama, OpenAI, or OpenRouter) or compare all three in parallel to get **overlap**, **stability**, **catalog alignment**, and an aggregate **trust score** with a short explanation.
 
 A **Streamlit** demo calls the analyze API and visualizes rankings and cross-model metrics.
 
 ## Features
 
 - **Multi-provider LLM ranking** — Ollama (local), OpenAI, OpenRouter; optional parallel `"all"` comparison.
-- **Catalog-grounded prompts** — Insurance vs loan intent picks `data/insurance_products.json` or `data/loan_providers.json`.
+- **Catalog-grounded prompts** — Insurance vs loan intent picks `data/insurance_products.json` or `data/loan_providers.json`; when `RAG_SERVICE_BASE_URL` is reachable, `/v1/analyze` can use **RAG search hits** as the catalog and prompt context instead of the full static file list.
+- **Optional local vector index** — Same process as the main API: `POST /index` (load JSON catalogs into Qdrant) and `POST /search` (embedding similarity over product text); configure Qdrant with `QDRANT_HOST` / `QDRANT_PORT` (defaults `localhost` / `6333`).
 - **Robust JSON pipeline** — Parse, normalize, validate product names; optional strict-JSON retry when rankings are empty.
-- **Trust metrics** — When comparing providers: ranking overlap, stability, derived trust score and confidence band.
+- **Trust metrics** — Multi-provider runs: overlap, stability, rank variance, catalog alignment accuracy, aggregate trust and confidence. The analyze response may also include **ground-truth** `accuracy` / `trust_score` when labeled data exists for the query (single- or multi-provider).
 - **Persistence** — SQLite under `TRUST_LENS_DATA_DIR` (default `./data`): `llm_responses` table logs each LLM call.
 - **Optional DEV mock** — Set `ENV=DEV` to skip real LLM calls and return a fixed mock payload (UI and pipeline testing).
 
@@ -24,6 +25,7 @@ A **Streamlit** demo calls the analyze API and visualizes rankings and cross-mod
 
 - **Python** 3.11+ recommended (project includes a 3.12-friendly dependency set).
 - **PyTorch** and **Transformers** (for explanation-insights NLP pipelines and optional `TrustScoreMLP` training code in `app/ml`).
+- **Sentence Transformers** and **Qdrant** (for `/index`, `/search`, and optional local vector workflows).
 - For **Ollama**: a running Ollama server and a suitable chat model (defaults try `phi3`, with `mistral` as fallback in code).
 - For **OpenAI** / **OpenRouter**: API keys in the environment.
 
@@ -55,6 +57,9 @@ Important variables:
 | `OPENAI_API_KEY` | Required for OpenAI provider |
 | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL` | Required for OpenRouter |
 | `TRUST_LENS_API_BASE` | Streamlit: base URL of the API (default `http://127.0.0.1:8000`) |
+| `RAG_SERVICE_BASE_URL` | Optional: separate **rag-service** base URL; analyze calls `POST …/search` for retrieval-augmented catalog (default `http://localhost:8002`) |
+| `RAG_SEARCH_TOP_K`, `RAG_SERVICE_TIMEOUT_SECONDS` | RAG hit count and HTTP timeout for that call |
+| `QDRANT_HOST`, `QDRANT_PORT` | Qdrant for in-process `/index` and `/search` on the main API (defaults `localhost`, `6333`) |
 
 Additional LLM tuning (see `app/core/config.py`): `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_TEMPERATURE`.
 
@@ -76,25 +81,40 @@ streamlit run streamlit_app.py
 
 The UI posts to `{TRUST_LENS_API_BASE}/v1/analyze` with a single selected provider.
 
-## API overview (prefix `/v1`)
+## API overview
+
+### Under `/v1`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness and API version |
-| `POST` | `/analyze` | Rank products + trust analysis; body: `{ "query": "...", "provider": "ollama" \| "openai" \| "openrouter" \| "all" }` |
-| `GET` | `/history` | List stored analyze runs from SQLite (see project overview for schema notes) |
-| `POST` | `/financial/query` | Direct financial template query (prompt registry) |
-| `POST` | `/financial/recommendation-bias` | Heuristic bias check vs ground-truth names |
-| `POST` | `/insights/explanation` | Sentiment + factor tags on free-text explanation (Hugging Face pipelines) |
+| `GET` | `/v1/health` | Liveness and API version |
+| `POST` | `/v1/analyze` | Rank products + trust analysis; body: `{ "query": "...", "provider": "ollama" \| "openai" \| "openrouter" \| "all" }` |
+| `GET` | `/v1/history` | List stored analyze runs from SQLite (see project overview for schema notes) |
+| `POST` | `/v1/financial/query` | Direct financial template query (prompt registry) |
+| `POST` | `/v1/financial/recommendation-bias` | Heuristic bias check vs ground-truth names |
+| `POST` | `/v1/insights/explanation` | Sentiment + factor tags on free-text explanation (Hugging Face pipelines) |
+
+### Root (vector search, same FastAPI app)
+
+These routes are mounted **without** the `/v1` prefix (see `app/main.py`).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/index` | Embed `data/insurance_products.json` and `data/loan_providers.json` and upsert into Qdrant collection `financial_products` |
+| `POST` | `/search` | Body: `{ "query": "...", "top_k": … }` — embedding search over that collection |
+
+The optional **`rag-service/`** project is a separate service with its own `/index` and `/search`; point `RAG_SERVICE_BASE_URL` at it when you want `/v1/analyze` to pull catalog context from that service instead of static files only.
 
 Full request and response models are defined in `app/models/` and exposed in OpenAPI.
 
 ## Project layout (high level)
 
-- `app/` — FastAPI app (`main.py`), routes, services, prompts, ML utilities.
+- `app/` — FastAPI app (`main.py`), `/v1` routes, services, prompts, ML utilities, Qdrant + embedding helpers.
 - `services/` — LLM client implementations (`ollama`, `openai`, `openrouter`), trust helpers, parsing and validation.
-- `data/` — Product catalogs used in prompts.
-- `streamlit_app.py` — Demo dashboard.
+- `data/` — Product catalogs used in prompts and `/index`.
+- `rag-service/` — Optional standalone FastAPI + Qdrant RAG API (`POST /search` consumed by the main app’s analyze flow).
+- `streamlit_app.py` — Demo dashboard (root of repo).
+- `frontend-ui/` — Additional Streamlit copy / layout variant (if present in your checkout).
 
 For architecture, data flow, trust formulas, and extension points, see **[PROJECTOVERVIEW.md](PROJECTOVERVIEW.md)**.
 
@@ -102,21 +122,12 @@ For architecture, data flow, trust formulas, and extension points, see **[PROJEC
 
 API version string: `1.0.0` (`app/utils/version.py`).
 
-Update README.md to include an Author section at the bottom.
-
-Include:
-
 ## Author
 
 Jayendran Subramanian  
-Full Stack Data Engineer | AI Engineer  
+Full Stack Data Engineer | AI Engineer
 
-Short line:
-"Passionate about building AI-driven systems for real-world financial intelligence and decisioning."
-
-Add a Disclaimer section to README.md.
-
-Include:
+Passionate about building AI-driven systems for real-world financial intelligence and decisioning.
 
 ## Disclaimer
 
