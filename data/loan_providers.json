@@ -1,0 +1,22 @@
+[
+  {
+    "name": "HDFC Bank Personal Loan",
+    "features": ["quick approval", "low interest rates"]
+  },
+  {
+    "name": "ICICI Bank Personal Loan",
+    "features": ["fast processing", "flexible tenure"]
+  },
+  {
+    "name": "State Bank of India Personal Loan",
+    "features": ["low interest", "trusted public bank"]
+  },
+  {
+    "name": "Axis Bank Personal Loan",
+    "features": ["minimal documentation", "quick disbursal"]
+  },
+  {
+    "name": "Kotak Mahindra Bank Personal Loan",
+    "features": ["competitive rates", "digital process"]
+  }
+]

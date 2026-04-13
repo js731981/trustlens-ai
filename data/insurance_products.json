@@ -1,0 +1,22 @@
+[
+  {
+    "name": "HDFC Ergo Health Insurance",
+    "features": ["high claim settlement ratio", "wide hospital network"]
+  },
+  {
+    "name": "ICICI Lombard Health Insurance",
+    "features": ["strong brand", "comprehensive coverage"]
+  },
+  {
+    "name": "Star Health Insurance",
+    "features": ["specialized health insurer", "good rural reach"]
+  },
+  {
+    "name": "Niva Bupa Health Insurance",
+    "features": ["cashless hospitals", "custom plans"]
+  },
+  {
+    "name": "Care Health Insurance",
+    "features": ["affordable plans", "high sum insured"]
+  }
+]

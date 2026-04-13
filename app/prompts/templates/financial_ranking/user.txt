@@ -1,0 +1,22 @@
+Authorized catalog (only valid values for each "name" field; copy strings exactly):
+$available_products
+
+User question:
+$user_query
+
+Return valid JSON only, with exactly this structure (no markdown, no commentary outside JSON):
+{"ranked_products":[{"rank":1,"name":"string","notes":"string or null"}],"explanation":"string"}
+
+STRICT:
+- If a product is not in the list above, DO NOT include it.
+- Always choose the best match from the given list only (never names outside that list).
+
+STRICT RULES (real-world grounding):
+- Do NOT invent products or use names not in the catalog above.
+- Only select from the provided list; each "name" must match a catalog line exactly (verbatim).
+- If unsure, still choose the best-matching entries from that list only.
+
+Requirements:
+- "ranked_products" is ordered by rank ascending (rank 1 is the top recommendation).
+- "notes" briefly says why it fits (or null); use only catalog product names in "name".
+- "explanation" summarizes your reasoning in plain language for the end user.
