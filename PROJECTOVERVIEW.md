@@ -20,9 +20,14 @@ flowchart LR
     RAnalyze["/v1/analyze"]
     RFin["/v1/financial/*"]
     RInsights["/v1/insights/explanation"]
+    RGeo["/v1/geo"]
+    RCompare["/v1/comparison/*"]
+    RDrift["/v1/drift"]
+    RV1History["/v1/history"]
     RHealth["/v1/health"]
     RIndex["POST /index"]
     RSearch["POST /search"]
+    RMetrics["GET /metrics"]
   end
   subgraph core [Core services]
     Intent[query_intent]
@@ -33,6 +38,9 @@ flowchart LR
     Compare[ranking_comparator]
     Trust[trust_scorer]
     Explain[explainer]
+    Drift[drift_tracker]
+    History[history_service]
+    Geo[geo_service]
   end
   subgraph llm [LLM adapters]
     Ollama[OllamaLLM]
@@ -68,6 +76,9 @@ flowchart LR
   Trust --> Explain
   RFin --> LLMRun
   RInsights --> NLP[Hugging Face pipelines]
+  RAnalyze --> Drift
+  RV1History --> History
+  RGeo --> Geo
 ```
 
 ## Repository structure
@@ -75,34 +86,33 @@ flowchart LR
 | Path | Role |
 |------|------|
 | `app/main.py` | FastAPI factory, lifespan (initializes SQLite), mounts `/v1` router **and** root routers for `indexing` and `search` (no `/v1` prefix). |
-| `app/api/v1/router.py` | Registers route modules: `health`, `analyze`, `financial`, `insights`. |
-| `app/api/v1/routes/analyze.py` | Main orchestration: intent, optional RAG catalog (`rag_client`), else static catalog; prompt build; multi/single provider run; parse/retry; trust, accuracy vs ground truth when available. |
+| `app/api/v1/router.py` | Registers `/v1` route modules: `health`, `analyze`, `financial`, `insights`, `comparison`, `drift`, `history`, `geo`. |
+| `app/api/v1/routes/analyze.py` | Main orchestration: intent, optional RAG catalog (`rag_client`), else static catalog; prompt build; multi/single provider run; parse/retry; trust + accuracy; persists analyze runs; adds geo summary and updates query history; updates drift tracking. |
+| `app/api/v1/routes/comparison.py` | `POST /v1/comparison/competitors` — competitor comparison for a company given a query. |
+| `app/api/v1/routes/drift.py` | `GET /v1/drift` — drift score + historical series for a query. |
+| `app/api/v1/routes/geo.py` | `POST /v1/geo` — geo analysis over an analyze-like payload. |
+| `app/api/v1/routes/history.py` | `GET /v1/history` — query history (SQLite-backed) with a `limit` parameter. |
 | `app/api/v1/routes/indexing.py` | `POST /index` — embed insurance + loan JSON from `data_dir` and upsert into Qdrant (`financial_products`). |
 | `app/api/v1/routes/search.py` | `POST /search` — query embedding + Qdrant vector search (`top_k`). |
-| `app/api/v1/routes/financial.py` | `financial/query` and `financial/recommendation-bias`. |
-| `app/api/v1/routes/insights.py` | `insights/explanation` — CPU-bound NLP in a thread. |
-| `app/api/v1/routes/health.py` | Simple health payload with version. |
+| `app/api/v1/routes/metrics.py` | `GET /metrics` — dashboard rollups (trust/geo averages, visibility, series). |
+| `app/api/v1/routes/financial.py` | `POST /v1/financial/query` and `POST /v1/financial/recommendation-bias`. |
+| `app/api/v1/routes/insights.py` | `POST /v1/insights/explanation` — CPU-bound NLP in a thread. |
+| `app/api/v1/routes/health.py` | `GET /v1/health` — simple health payload with version. |
 | `app/services/rag_client.py` | Async `fetch_rag_context_for_query`: `POST {RAG_SERVICE_BASE_URL}/search` with `{query, limit}`; builds deduped catalog names and hit payloads for the prompt. |
-| `app/services/embedding_service.py` | Sentence-transformers embeddings for `/index` and `/search`. |
-| `app/services/qdrant_service.py` | Qdrant client (`QDRANT_HOST` / `QDRANT_PORT`), collection `financial_products`. |
+| `app/services/metrics/metrics_service.py` | Aggregations for `/metrics` (avg trust/geo, visibility, series). |
+| `app/services/history/history_service.py` | Query history storage/retrieval used by `/v1/history`. |
+| `app/services/drift/drift_tracker.py` | Drift storage + retrieval used by `/v1/drift` and analyze persistence. |
+| `app/services/geo/geo_service.py` | Geo scoring used by `/v1/geo` and attached into `/v1/analyze` responses. |
+| `app/services/llm/` | `get_llm(provider)` factory and provider implementations reading env vars. |
+| `app/services/trust/` | `compare_rankings`, `compute_trust_score`, `explain_trust`, and accuracy helpers. |
+| `app/services/utils/` | JSON extraction, normalization, catalog validation helpers. |
 | `app/core/config.py` | Pydantic settings from environment (including `ENV=DEV` mock mode). |
 | `app/core/logging.py` | Logging setup used across services. |
-| `app/services/analyze.py` | `run_analyze`: `"all"` runs three providers concurrently; non-Ollama requests **fall back to Ollama** on configuration or upstream errors. |
-| `app/services/financial_llm.py` | Prompt rendering override path, LLM invocation via `get_llm`, retries, deflection detection, SQLite logging of raw/parsed outputs. Legacy `query_financial_llm` uses **settings-based** OpenAI-compatible HTTP (separate from provider factory). |
-| `app/services/tracking_store.py` | SQLite: `llm_responses`, `analyze_runs`; Kendall tau helpers; `list_analyze_history`. |
-| `app/services/query_intent.py` | Keyword-based `insurance` vs `loan` intent for catalog selection. |
-| `app/services/explanation_insights.py` | Sentiment + zero-shot “price / trust / coverage” factor detection using Transformers pipelines. |
-| `app/services/recommendation_bias.py` | Heuristics: hallucination vs catalog, missing ground-truth top picks, brand concentration. |
-| `app/services/ranking_consistency.py` | Normalization utilities shared with bias and drift logic. |
 | `app/prompts/` | Template registry and `templates/financial_ranking/` system and user prompts. |
 | `app/models/` | Pydantic models for API contracts. |
-| `app/ml/trust_score_model.py` | `TrustScoreMLP` and toy training utilities (four scalar features → trust); not wired as the live scorer for `/analyze` (live scorer is heuristic in `services/trust/trust_scorer.py`). |
-| `services/llm/` | `get_llm(provider)` factory and provider classes reading env vars. |
-| `services/trust/` | `compare_rankings`, `compute_trust_score`, `explain_trust`. |
-| `services/utils/` | JSON extraction, normalization, catalog validation, query classification helpers. |
 | `data/insurance_products.json`, `data/loan_providers.json` | Catalogs whose **names** are injected into prompts and used to validate returned products. |
-| `streamlit_app.py` | Calls `POST /v1/analyze` with a single provider; displays metrics when the API returns multi-provider results (the select box does not expose `"all"`; you can still call the API with `"all"` from curl or OpenAPI). |
-| `rag-service/` | Standalone FastAPI app: loads embeddings + Qdrant on startup; exposes `POST /index`, `POST /search`, `GET /health`. Intended as the HTTP target for `RAG_SERVICE_BASE_URL` when you want analyze to use retrieval instead of only static JSON names. |
+| `streamlit_app.py` | Calls `POST /v1/analyze` with a single provider and visualizes the response (including metrics/trust when provider `"all"` is used via API). |
+| `rag-service/` | Optional standalone FastAPI app: exposes `POST /index`, `POST /search`, `GET /health`. Intended as the HTTP target for `RAG_SERVICE_BASE_URL` when you want analyze to use retrieval instead of only static JSON names. |
 
 ## Request flow: `POST /v1/analyze`
 
@@ -140,7 +150,7 @@ flowchart LR
 
 | Provider | Class | Key environment |
 |----------|--------|------------------|
-| Ollama | `OllamaLLM` | `OLLAMA_BASE_URL` (default `http://localhost:11434`); models default `phi3` with optional fallback `mistral`. |
+| Ollama | `OllamaLLM` | `OLLAMA_BASE_URL` (default `http://localhost:11434`); model defaults to `phi3` (optional fallback via `OLLAMA_FALLBACK_MODEL`). |
 | OpenAI | `OpenAILLM` | `OPENAI_API_KEY`; base URL `OPENAI_BASE_URL` or `LLM_BASE_URL` or OpenAI default. |
 | OpenRouter | `OpenRouterLLM` | `OPENROUTER_API_KEY`; `OPENROUTER_BASE_URL` default `https://openrouter.ai/api/v1`. |
 
@@ -151,7 +161,7 @@ flowchart LR
 ## Persistence (SQLite)
 
 - **Database file**: `{TRUST_LENS_DATA_DIR}/trust_lens.db` (WAL mode).
-- **`llm_responses`** — Written on successful or parse-failing LLM runs from `query_financial_llm_multi` / related tracking hooks: session id, query text, query hash key, raw content, parsed JSON or parse error, model identifier.
+- **`llm_responses`** — Written on successful or parse-failing LLM runs from the LLM execution pipeline / tracking hooks: session id, query text, query hash key, raw content, parsed JSON or parse error, model identifier.
 - **`analyze_runs`** — Schema supports trust score, ranking JSON, drift vs prior run, and full snapshot JSON. **`record_analyze_run`** is implemented in `tracking_store.py`; **`GET /v1/history`** reads this table via `list_analyze_history`. If nothing in the app calls `record_analyze_run`, the history endpoint will return an empty list while `llm_responses` may still grow.
 
 ## Other API surfaces

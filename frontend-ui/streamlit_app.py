@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -55,15 +56,182 @@ def _format_metric(value: float | None) -> str:
     return f"{float(value):.1%}"
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def _fetch_metrics(api_base: str) -> dict[str, Any] | None:
+    try:
+        resp = httpx.get(
+            f"{api_base}/metrics",
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            headers={"Cache-Control": "no-cache"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _fetch_history(api_base: str) -> list[dict[str, Any]]:
+    try:
+        resp = httpx.get(
+            f"{api_base}/history",
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            headers={"Cache-Control": "no-cache"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+    except Exception:
+        return []
+
+
+def _coerce_ts(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        # Accept both ISO and "YYYY-MM-DD HH:MM:SS" from sqlite.
+        s = str(value).replace("Z", "+00:00")
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _render_dashboard(api_base: str) -> None:
+    st.title("Dashboard")
+    st.caption(f"GET `{api_base}/metrics` and `{api_base}/history`")
+
+    metrics = _fetch_metrics(api_base) or {}
+    avg_trust = metrics.get("avg_trust")
+    visibility = metrics.get("visibility")
+    queries = metrics.get("queries")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Avg trust", f"{float(avg_trust or 0.0):.2f}")
+    with c2:
+        st.metric("Visibility", _format_metric(float(visibility) if visibility is not None else None))
+    with c3:
+        st.metric("Queries", f"{int(queries or 0)}")
+
+    history = _fetch_history(api_base)
+    if not history:
+        st.info("No history yet. Run a few analyses to populate charts.")
+        return
+
+    df = pd.DataFrame(history)
+    # normalize columns
+    if "timestamp" not in df.columns and "created_at" in df.columns:
+        df["timestamp"] = df["created_at"]
+    if "timestamp" in df.columns:
+        df["timestamp_dt"] = df["timestamp"].apply(_coerce_ts)
+        df = df[df["timestamp_dt"].notna()].copy()
+        df["timestamp_dt"] = pd.to_datetime(df["timestamp_dt"], utc=True)
+
+    if "trust_score" in df.columns:
+        df["trust_score"] = pd.to_numeric(df["trust_score"], errors="coerce")
+
+    st.markdown("### Trust trend")
+    trend = (
+        df.dropna(subset=["timestamp_dt"])
+        .sort_values("timestamp_dt")
+        .loc[:, ["timestamp_dt", "trust_score"]]
+        .dropna(subset=["trust_score"])
+    )
+    if trend.empty:
+        st.caption("Not enough data to chart trust trend yet.")
+    else:
+        trend = trend.rename(columns={"timestamp_dt": "timestamp"})
+        st.line_chart(trend.set_index("timestamp")["trust_score"])
+
+    st.markdown("### Recent queries")
+    cols = [c for c in ["id", "query", "provider", "trust_score", "timestamp", "created_at"] if c in df.columns]
+    st.dataframe(df.sort_values("timestamp_dt", ascending=False)[cols].head(25), use_container_width=True, hide_index=True)
+
+
+def _render_history(api_base: str) -> None:
+    st.title("History")
+    st.caption(f"GET `{api_base}/history`")
+
+    history = _fetch_history(api_base)
+    if not history:
+        st.info("No saved queries yet.")
+        return
+
+    df = pd.DataFrame(history)
+    if "timestamp" not in df.columns and "created_at" in df.columns:
+        df["timestamp"] = df["created_at"]
+    if "trust_score" in df.columns:
+        df["trust_score"] = pd.to_numeric(df["trust_score"], errors="coerce")
+
+    # Quick filters
+    with st.sidebar:
+        st.markdown("### History filters")
+        provider = st.selectbox(
+            "Provider",
+            options=["all"] + sorted([str(x) for x in df.get("provider", pd.Series(dtype=str)).dropna().unique().tolist()]),
+            index=0,
+        )
+        q_contains = st.text_input("Query contains", value="")
+
+    view = df.copy()
+    if provider != "all" and "provider" in view.columns:
+        view = view[view["provider"].astype(str) == provider]
+    if q_contains and "query" in view.columns:
+        view = view[view["query"].astype(str).str.contains(q_contains, case=False, na=False)]
+
+    cols = [c for c in ["id", "query", "provider", "trust_score", "timestamp", "created_at"] if c in view.columns]
+    st.dataframe(view[cols], use_container_width=True, hide_index=True)
+
+    st.markdown("### Re-run a past query")
+    # Make a compact chooser instead of dozens of buttons.
+    q_options = (
+        view["query"].dropna().astype(str).head(100).tolist()
+        if "query" in view.columns
+        else []
+    )
+    q_pick = st.selectbox("Pick query", options=q_options, index=0 if q_options else None)
+    if st.button("Use this query in Analyze", type="secondary", disabled=not bool(q_pick)):
+        st.session_state["analyze_query_prefill"] = q_pick
+        st.session_state["nav_page"] = "Analyze"
+        st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="TrustLens AI", layout="wide")
-    st.title("TrustLens AI")
+    st.sidebar.title("TrustLens AI")
+    if "nav_page" not in st.session_state:
+        st.session_state["nav_page"] = "Analyze"
+
+    page = st.sidebar.radio(
+        "Menu",
+        options=["Analyze", "Dashboard", "History"],
+        index=["Analyze", "Dashboard", "History"].index(st.session_state["nav_page"]),
+    )
+    st.session_state["nav_page"] = page
+
+    if page == "Dashboard":
+        _render_dashboard(_api_base())
+        return
+
+    if page == "History":
+        _render_history(_api_base())
+        return
+
+    st.title("Analyze")
     st.caption(f"POST `{_api_base()}/v1/analyze`")
 
+    prefill = str(st.session_state.pop("analyze_query_prefill", "") or "")
     query = st.text_input(
         "Query",
         placeholder="What should we rank and analyze?",
         label_visibility="visible",
+        value=prefill,
     )
     provider = st.selectbox(
         "Provider",

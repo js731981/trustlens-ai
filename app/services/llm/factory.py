@@ -13,7 +13,15 @@ def get_llm(provider: str) -> BaseLLM:
 
     if normalized == "ollama":
         base_url = os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
-        return OllamaLLM(base_url=base_url)
+        model = os.getenv("OLLAMA_MODEL", "phi3")
+        fallback_model = os.getenv("OLLAMA_FALLBACK_MODEL") or None
+        stream = (os.getenv("OLLAMA_STREAM") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+        return OllamaLLM(
+            base_url=base_url,
+            model=model,
+            fallback_model=fallback_model,
+            stream=stream,
+        )
     if normalized == "openai":
         base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1"
         return OpenAILLM(base_url=base_url)

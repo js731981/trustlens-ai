@@ -21,3 +21,12 @@ qdrant-client>=1.12.0,<2
 # Streamlit demo (`streamlit_app.py`)
 streamlit>=1.39.0
 plotly>=5.24.0
+
+# Streamlit tables/charts
+pandas>=2.2.0,<3
+
+# PDF report generation (`app/services/report/pdf_generator.py`)
+reportlab>=4.1.0,<5
+
+# Common numeric runtime (explicit for plotly/pandas ecosystems)
+numpy>=1.26.0,<3

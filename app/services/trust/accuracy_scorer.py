@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Sequence, TypedDict
 
-from services.trust.ranking_comparator import _name_from_row, _product_items
+from app.services.trust.ranking_comparator import _name_from_row, _product_items
 
 
 def _normalize_item(value: Any) -> str:

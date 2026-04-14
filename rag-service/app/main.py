@@ -41,13 +41,17 @@ def get_store() -> QdrantDocumentStore:
 async def lifespan(app: FastAPI):
     global _embedder, _store
     settings = get_settings()
-    embedder = EmbeddingService(settings.embedding_model)
-    embedder.load()
+    embedder = EmbeddingService(
+        settings.embedding_model,
+        vector_size=settings.embedding_vector_size,
+    )
+    if settings.embedding_load_on_startup:
+        embedder.load()
     client = build_qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     store = QdrantDocumentStore(
         client=client,
         collection_name=settings.qdrant_collection,
-        vector_size=embedder.vector_size,
+        vector_size=settings.embedding_vector_size,
     )
     try:
         store.ensure_collection()
@@ -85,7 +89,11 @@ app = create_app()
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "rag-service"}
+    return {
+        "status": "ok",
+        "service": "rag-service",
+        "embeddings_loaded": _embedder is not None and _embedder._model is not None,  # type: ignore[attr-defined]
+    }
 
 
 @app.post("/index", response_model=IndexResponse)
@@ -95,7 +103,18 @@ def index_documents(
     store: QdrantDocumentStore = Depends(get_store),
 ) -> IndexResponse:
     texts = [d.text for d in body.documents]
-    vectors = embedder.embed(texts)
+    try:
+        vectors = embedder.embed(texts)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Embeddings model is not available yet (download/load failed). "
+                "Check network access to Hugging Face or pre-download the model. "
+                "You can also avoid loading at startup by keeping "
+                "EMBEDDING_LOAD_ON_STARTUP=false (default)."
+            ),
+        ) from e
     items: list[tuple[str, list[float], str, dict[str, Any]]] = []
     returned_ids: list[str] = []
     for doc, vec in zip(body.documents, vectors, strict=True):
@@ -112,7 +131,16 @@ def search_documents(
     embedder: EmbeddingService = Depends(get_embedder),
     store: QdrantDocumentStore = Depends(get_store),
 ) -> SearchResponse:
-    (qvec,) = embedder.embed([body.query])
+    try:
+        (qvec,) = embedder.embed([body.query])
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Embeddings model is not available yet (download/load failed). "
+                "Check network access to Hugging Face or pre-download the model."
+            ),
+        ) from e
     raw = store.search(qvec, body.limit)
     hits = [
         SearchHit(

@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     qdrant_api_key: str | None = None
     qdrant_collection: str = "rag_documents"
     embedding_model: str = "all-MiniLM-L6-v2"
+    # Keep rag-service startup fast/offline-friendly by not requiring model download.
+    # Default matches `sentence-transformers/all-MiniLM-L6-v2` (384 dims).
+    embedding_vector_size: int = 384
+    # If true, try loading the embedding model during FastAPI startup.
+    # If false (default), model loads on first embed call.
+    embedding_load_on_startup: bool = False
     environment: str = "development"
 
 

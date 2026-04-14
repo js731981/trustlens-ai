@@ -19,13 +19,13 @@ from app.core.logging import get_logger
 from app.models.financial import FinancialQueryResponse
 from app.prompts.registry import render_prompt
 from app.services import tracking_store
-from services.llm.factory import get_llm
-from services.llm.prompt_builder import (
+from app.services.llm.factory import get_llm
+from app.services.llm.prompt_builder import (
     documents_from_product_names,
     format_top_results_block,
     insurance_catalog_product_names,
 )
-from services.utils.parser import parse_llm_json
+from app.services.utils.parser import parse_llm_json
 
 logger = get_logger(__name__)
 

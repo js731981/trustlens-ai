@@ -6,7 +6,7 @@ import os
 
 from dotenv import load_dotenv
 
-from services.llm.ollama import OllamaLLM
+from app.services.llm.ollama import OllamaLLM
 
 
 def main() -> None:

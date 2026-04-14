@@ -175,6 +175,10 @@ class AnalyzeApiResponse(BaseModel):
         le=1.0,
         description="Aggregate trust using stability/overlap from ranking comparison and ground-truth accuracy when set.",
     )
+    geo: dict[str, Any] | None = Field(
+        default=None,
+        description="GEO analysis payload (score + issues/recommendations) derived from the parsed ranking output.",
+    )
 
 
 class AnalyzeComparisonResponse(BaseModel):

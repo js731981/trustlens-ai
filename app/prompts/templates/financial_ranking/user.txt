@@ -1,17 +1,10 @@
-Context:
-$top_results
+Return ONLY valid JSON:
 
-Query: "$user_query"
+{
+"ranked_products": [
+{"rank": 1, "name": "...", "notes": "..."}
+],
+"explanation": "..."
+}
 
-Instructions:
-- Use ONLY context items
-- Rank top 5
-- Return valid JSON only, with exactly this structure (no markdown, no commentary outside JSON):
-{"ranked_products":[{"rank":1,"name":"string","notes":"string or null"}],"explanation":"string"}
-
-STRICT:
-- Each "name" must match a context item verbatim (copy strings from the numbered labels where shown).
-- If a product is not in the context above, DO NOT include it.
-- "ranked_products" is ordered by rank ascending (rank 1 is the top recommendation).
-- "notes" briefly says why it fits (or null); use only context product names in "name".
-- "explanation" summarizes your reasoning in plain language for the end user.
+Question: $user_query

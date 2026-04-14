@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from services.trust.trust_scorer import _coerce_float
+from app.services.trust.trust_scorer import _coerce_float
 
 
 class TrustExplanation(TypedDict):

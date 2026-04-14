@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import os
 from typing import Any
 
 from dotenv import load_dotenv
 import httpx
+import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 
 DEFAULT_API_BASE = "http://127.0.0.1:8000"
@@ -55,6 +58,28 @@ def _trust_gauge(trust_0_1: float) -> go.Figure:
     )
     fig.update_layout(height=280, margin=dict(l=24, r=24, t=48, b=24))
     return fig
+
+
+def _safe_get_json(url: str, *, timeout_s: float = 30.0) -> dict[str, Any] | None:
+    try:
+        resp = httpx.get(url, timeout=httpx.Timeout(timeout_s, connect=10.0))
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_get_json_list(url: str, *, timeout_s: float = 30.0) -> list[dict[str, Any]]:
+    try:
+        resp = httpx.get(url, timeout=httpx.Timeout(timeout_s, connect=10.0))
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+    except Exception:
+        return []
 
 
 def _render_insights(insights: dict[str, Any]) -> None:
@@ -111,10 +136,122 @@ def _render_rankings(rankings: list[dict[str, Any]]) -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
+def _render_enterprise_dashboard(api_base: str) -> None:
+    st.subheader("Enterprise Dashboard")
+
+    with st.sidebar:
+        st.markdown("### Dashboard filters")
+        query_type = st.selectbox("Query type", options=["all", "insurance", "loan"], index=0)
+        time_range = st.selectbox("Time range", options=["24h", "7d", "30d", "90d", "all"], index=2)
+
+    metrics = _safe_get_json(f"{api_base}/metrics") or {
+        "avg_trust": 0.0,
+        "avg_geo": 0.0,
+        "visibility": 0.0,
+        "queries": 0,
+    }
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Avg trust", f"{float(metrics.get('avg_trust') or 0.0):.1%}")
+    with c2:
+        st.metric("Avg geo", f"{float(metrics.get('avg_geo') or 0.0):.1%}")
+    with c3:
+        st.metric("Visibility", f"{float(metrics.get('visibility') or 0.0):.1%}")
+    with c4:
+        st.metric("Queries", f"{int(metrics.get('queries') or 0)}")
+
+    # Prefer the non-versioned history endpoint (has timestamp + geo_score).
+    history = _safe_get_json_list(f"{api_base}/history?limit=100")
+    if not history:
+        # Backward compatibility for older API versions.
+        history = _safe_get_json_list(f"{api_base}/v1/history")
+    if not history:
+        st.info("No history yet. Run a few analyses to populate charts.")
+        return
+
+    df = pd.DataFrame(history)
+    # Normalize timestamps (support both /history and /v1/history shapes).
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    elif "created_at" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+    else:
+        df["timestamp"] = pd.NaT
+
+    def _snapshot_intent(row: Any) -> str:
+        snap = row.get("snapshot") if isinstance(row, dict) else None
+        if isinstance(snap, dict):
+            return str(snap.get("intent") or "unknown")
+        return "unknown"
+
+    def _snapshot_provider(row: Any) -> str:
+        snap = row.get("snapshot") if isinstance(row, dict) else None
+        if isinstance(snap, dict):
+            return str(snap.get("provider_used") or "unknown")
+        return "unknown"
+
+    rows = history
+    df["intent"] = [_snapshot_intent(r) for r in rows]
+    df["provider_used"] = [_snapshot_provider(r) for r in rows]
+
+    if query_type != "all":
+        df = df[df["intent"] == query_type]
+
+    now = datetime.now(timezone.utc)
+    if time_range != "all":
+        delta = {
+            "24h": timedelta(hours=24),
+            "7d": timedelta(days=7),
+            "30d": timedelta(days=30),
+            "90d": timedelta(days=90),
+        }[time_range]
+        cutoff = now - delta
+        df = df[df["timestamp"].notna() & (df["timestamp"] >= cutoff)]
+
+    if df.empty:
+        st.info("No runs match the current filters.")
+        return
+
+    # Ensure numeric columns exist for charts/tables.
+    if "trust_score" in df.columns:
+        df["trust_score"] = pd.to_numeric(df["trust_score"], errors="coerce")
+    if "geo_score" in df.columns:
+        df["geo_score"] = pd.to_numeric(df["geo_score"], errors="coerce")
+
+    st.markdown("### Trust trend chart")
+    trust_df = df.sort_values("timestamp")[["timestamp", "trust_score"]].dropna()
+    if trust_df.empty:
+        st.caption("Not enough trust data to chart yet.")
+    else:
+        fig = px.line(trust_df, x="timestamp", y="trust_score", markers=True)
+        fig.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20))
+        fig.update_yaxes(range=[0, 1])
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### Geo trend chart")
+    geo_df = df.sort_values("timestamp")[["timestamp", "geo_score"]].dropna()
+    if geo_df.empty:
+        st.caption("Not enough geo data to chart yet.")
+    else:
+        fig = px.line(geo_df, x="timestamp", y="geo_score", markers=True)
+        fig.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20))
+        fig.update_yaxes(range=[0, 1])
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### Recent queries table")
+    preferred_cols = ["timestamp", "query", "provider", "provider_used", "trust_score", "geo_score"]
+    cols = [c for c in preferred_cols if c in df.columns]
+    view = df.sort_values("timestamp", ascending=False)
+    if cols:
+        st.dataframe(view[cols].head(25), use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(view.head(25), use_container_width=True, hide_index=True)
+
+
 def main() -> None:
-    st.set_page_config(page_title="Trust Lens", layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="Trust Lens", layout="wide", initial_sidebar_state="expanded")
     st.title("Trust Lens")
-    st.caption("Connects to the Trust Lens API `/v1/analyze` endpoint (multi-LLM).")
+    st.caption("Enterprise dashboard + analysis workspace.")
 
     base = _api_base()
     with st.sidebar:
@@ -122,6 +259,14 @@ def main() -> None:
         st.caption("Start the API: `uvicorn app.main:app --reload`")
 
     api_base = st.session_state.get("api_base_input", base).rstrip("/")
+
+    tab_dash, tab_analyze = st.tabs(["Dashboard", "Analyze"])
+    with tab_dash:
+        _render_enterprise_dashboard(api_base)
+
+    with tab_analyze:
+        st.subheader("Analyze")
+        st.caption("Calls the Trust Lens API `/v1/analyze` endpoint.")
 
     query = st.text_area(
         "Query",

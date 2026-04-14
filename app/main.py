@@ -5,9 +5,12 @@ from fastapi import FastAPI
 
 from app.api.v1.router import api_router
 from app.api.v1.routes import indexing as indexing_routes
+from app.api.v1.routes import history as history_routes
+from app.api.v1.routes import metrics as metrics_routes
 from app.api.v1.routes import search as search_routes
 from app.core.config import get_settings
 from app.core.logging import get_logger, setup_logging
+from app.core.database import init_db
 from app.services import tracking_store
 
 logger = get_logger(__name__)
@@ -17,6 +20,7 @@ logger = get_logger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     tracking_store.init_db()
+    init_db()
     logger.info(
         "Application startup",
         extra={"environment": settings.environment, "data_dir": str(settings.data_dir)},
@@ -36,6 +40,8 @@ def create_app() -> FastAPI:
     )
     application.include_router(api_router, prefix="/v1")
     application.include_router(indexing_routes.router)
+    application.include_router(history_routes.router)
+    application.include_router(metrics_routes.router)
     application.include_router(search_routes.router)
     return application
 

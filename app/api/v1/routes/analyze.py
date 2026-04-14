@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import Any, Iterable, cast
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -24,21 +25,25 @@ from app.prompts.registry import UnknownPromptTemplateError
 from app.services import analyze as analyze_service
 from app.services import financial_llm as financial_llm_service
 from app.services import rag_client
+from app.services import tracking_store
 from app.services.financial_llm import LLM_DEFLECTION_MARKER, build_financial_prompt
 from app.services.query_intent import classify_query
-from services.llm.prompt_builder import load_catalog_product_names
-from services.trust.accuracy_scorer import (
+from app.services.drift.drift_tracker import track_drift
+from app.services.geo.geo_service import analyze_geo
+from app.services.history.history_service import save_query
+from app.services.llm.prompt_builder import load_catalog_product_names
+from app.services.trust.accuracy_scorer import (
     accuracy_score_vs_catalog,
     compute_accuracy,
     merged_provider_ranked_names,
 )
-from services.trust.ground_truth import load_ground_truth_for_query
-from services.trust.explainer import explain_trust
-from services.trust.ranking_comparator import compare_rankings
-from services.trust.trust_scorer import compute_trust_score
-from services.utils.normalizer import normalize_output
-from services.utils.parser import parse_llm_json
-from services.utils.validator import validate_products
+from app.services.trust.ground_truth import load_ground_truth_for_query
+from app.services.trust.explainer import explain_trust
+from app.services.trust.ranking_comparator import compare_rankings
+from app.services.trust.trust_scorer import compute_trust_score
+from app.services.utils.normalizer import normalize_output
+from app.services.utils.parser import parse_llm_json
+from app.services.utils.validator import validate_products
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -202,6 +207,76 @@ def _shape_analyze_response(result: AnalyzeResponse, catalog_names: tuple[str, .
     return shaped
 
 
+def _rankings_from_parsed(parsed_output: dict[str, Any]) -> list[dict[str, Any]]:
+    ranked = parsed_output.get("ranked_products") or []
+    if not isinstance(ranked, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            rank = int(item.get("rank"))
+        except Exception:
+            continue
+        if rank <= 0:
+            continue
+        out.append({"name": name, "rank": rank})
+    out.sort(key=lambda x: int(x["rank"]))
+    return out
+
+
+def _persist_analyze_run(
+    *,
+    query: str,
+    intent: str,
+    provider_mode: str,
+    provider_used: str,
+    trust_score: float,
+    ranking_names: list[str],
+    parsed_rankings: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+) -> None:
+    qk = tracking_store.query_key(query)
+    prior = tracking_store.fetch_prior_run_for_query(qk)
+    kendall_tau = None
+    drift_score = None
+    prior_trust = None
+    prior_id = None
+    prior_at = None
+    n_items = 0
+    if prior is not None:
+        kendall_tau, n_items = tracking_store.kendall_tau_rank_agreement(prior.ranking_names, ranking_names)
+        drift_score = tracking_store.drift_from_tau(kendall_tau)
+        prior_trust = prior.trust_score
+        prior_id = prior.id
+        prior_at = prior.created_at
+
+    run_id = str(uuid4())
+    tracking_store.record_analyze_run(
+        run_id=run_id,
+        user_query=query,
+        trust_score=float(max(0.0, min(1.0, trust_score))),
+        ranking_names=ranking_names,
+        snapshot={
+            **snapshot,
+            "intent": intent,
+            "provider_mode": provider_mode,
+            "provider_used": provider_used,
+        },
+        drift_score=drift_score,
+        kendall_tau=kendall_tau,
+        prior_trust_score=prior_trust,
+        prior_run_id=prior_id,
+        prior_run_at=prior_at,
+        n_items_drift=n_items,
+    )
+    track_drift(query, parsed_rankings)
+
+
 @router.post(
     "/analyze",
     response_model=AnalyzeApiResponse,
@@ -288,7 +363,29 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
                 debug_payload = next(iter(debug_by_provider.values()))
             else:
                 debug_payload = debug_by_provider
-            return AnalyzeApiResponse(
+
+            try:
+                ranking_names = merged_provider_ranked_names(results_for_compare)
+                _persist_analyze_run(
+                    query=query,
+                    intent=intent,
+                    provider_mode="all",
+                    provider_used="all",
+                    trust_score=float(trust_raw["trust_score"]),
+                    ranking_names=[str(x) for x in ranking_names],
+                    parsed_rankings=_rankings_from_parsed({"ranked_products": [{"name": n, "rank": i + 1} for i, n in enumerate(ranking_names)]}),
+                    snapshot={
+                        "metrics": metrics_full,
+                        "trust": trust_raw,
+                        "providers_used": providers_used,
+                        "accuracy": gt_accuracy,
+                        "trust_score": gt_trust_score,
+                    },
+                )
+            except Exception:
+                logger.exception("analyze_persist_failed")
+
+            response = AnalyzeApiResponse(
                 query=query,
                 providers_used=providers_used,
                 results=shaped,
@@ -316,6 +413,29 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
                 accuracy=gt_accuracy,
                 trust_score=gt_trust_score,
             )
+            # GEO: compute from the first successful provider's parsed output (stable + backward compatible).
+            geo_result: dict[str, Any] | None = None
+            for prov in providers_used:
+                entry = shaped.get(prov)
+                if isinstance(entry, AnalyzeResponse):
+                    geo_result = analyze_geo(entry.parsed_output)
+                    break
+            if geo_result is None:
+                geo_result = analyze_geo({"ranked_products": [], "explanation": ""})
+            response.geo = geo_result
+            try:
+                save_query(
+                    {
+                        "query": body.query,
+                        "provider": str(body.provider),
+                        "trust_score": float(response.trust.score) if response.trust is not None else 0.0,
+                        "geo_score": float(geo_result.get("score", 0)) if isinstance(geo_result, dict) else 0.0,
+                    }
+                )
+                print("Query saved successfully")
+            except Exception:
+                logger.exception("history_save_failed")
+            return response
         try_first = _try_shape_analyze_response(result, catalog_names)
         if isinstance(try_first, AnalyzeProviderError):
             raise HTTPException(
@@ -334,7 +454,26 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
         gt_accuracy, gt_trust_score = _ground_truth_accuracy_and_trust(
             query, settings.data_dir, results_one, None
         )
-        return AnalyzeApiResponse(
+        try:
+            rankings = _rankings_from_parsed(shaped_one.parsed_output)
+            names = [str(x.get("name")) for x in rankings if isinstance(x, dict) and x.get("name")]
+            persist_score = float(gt_trust_score) if gt_trust_score is not None else 0.0
+            _persist_analyze_run(
+                query=query,
+                intent=intent,
+                provider_mode=str(body.provider),
+                provider_used=str(shaped_one.provider_used),
+                trust_score=persist_score,
+                ranking_names=names,
+                parsed_rankings=rankings,
+                snapshot={
+                    "accuracy": gt_accuracy,
+                    "trust_score": gt_trust_score,
+                },
+            )
+        except Exception:
+            logger.exception("analyze_persist_failed")
+        response = AnalyzeApiResponse(
             query=query,
             providers_used=[p],
             results={p: shaped_one},
@@ -345,6 +484,21 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
             accuracy=gt_accuracy,
             trust_score=gt_trust_score,
         )
+        geo_result = analyze_geo(shaped_one.parsed_output)
+        response.geo = geo_result
+        try:
+            save_query(
+                {
+                    "query": body.query,
+                    "provider": str(body.provider),
+                    "trust_score": float(response.trust_score) if response.trust_score is not None else 0.0,
+                    "geo_score": float(geo_result.get("score", 0)) if isinstance(geo_result, dict) else 0.0,
+                }
+            )
+            print("Query saved successfully")
+        except Exception:
+            logger.exception("history_save_failed")
+        return response
     except UnknownPromptTemplateError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except financial_llm_service.FinancialLLMConfigurationError as exc:
