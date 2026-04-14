@@ -134,6 +134,9 @@ Full Stack Data Engineer | AI Engineer
 
 Passionate about building AI-driven systems for real-world financial intelligence and decisioning.
 
+## Live Demo
+https://huggingface.co/spaces/js731981/trustlens-ai
+
 ## Disclaimer
 
 This project is a proof-of-concept AI system built for educational and research purposes only.
