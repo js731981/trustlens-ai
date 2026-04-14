@@ -9,7 +9,7 @@ short_description: LLM trust & GEO ranking demo
 
 # TrustLens AI — Hugging Face Space
 
-This folder is a **standalone Gradio demo** that mirrors the *look and feel* of a “trust and GEO” analytics panel. It is **not** wired to the main Trust Lens AI FastAPI service: everything runs in-process using a small deterministic simulator in `utils.py`.
+This is a demo UI of the full TrustLens AI system (see [full project on GitHub](https://github.com/js731981/trustlens-ai)). This folder is a **standalone Gradio demo** that mirrors the *look and feel* of a “trust and GEO” analytics panel. It is **not** wired to the main Trust Lens AI FastAPI service: everything runs in-process using a small deterministic simulator in `utils.py`.
 
 ## What you get
 
@@ -54,3 +54,11 @@ Use **Python 3.10+** (3.11 or 3.12 recommended). The app calls `demo.launch()`; 
 ## Relation to the main project
 
 The full **Trust Lens AI** product (FastAPI analyze API, optional RAG, Streamlit UI, persistence) lives in the repository root. This Space is intentionally **lightweight** for sharing a UI prototype without API keys or GPU stacks.
+
+## 🔗 Full Project Repository
+
+This Hugging Face Space is a lightweight demo of the full TrustLens AI system.
+
+For the complete implementation (backend, RAG pipeline, multi-service architecture, and advanced features), visit:
+
+👉 https://github.com/js731981/trustlens-ai
