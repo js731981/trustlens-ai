@@ -65,18 +65,32 @@ CSS = """
 }
 .header h1 { color: white; margin: 0; font-size: 30px; font-weight: 800; letter-spacing: -0.02em; }
 .header p { color: #dbeafe; margin: 4px 0 0 0; }
-.tl-badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.tl-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.28);
-  background: rgba(255,255,255,0.14);
-  color: rgba(255,255,255,0.95);
-  font-weight: 800;
-  font-size: 12px;
-  letter-spacing: 0.01em;
+
+/* Native Gradio header tag buttons (HF-safe; no custom flex on badge strip) */
+#tl-header-tags {
+  margin-top: 10px;
+}
+#tl-header-tags button {
+  border-radius: 999px !important;
+  background: linear-gradient(180deg, rgba(255,255,255,0.20), rgba(255,255,255,0.10)) !important;
+  border: 1px solid rgba(255,255,255,0.28) !important;
+  color: rgba(255,255,255,0.95) !important;
+  font-weight: 800 !important;
+  font-size: 12px !important;
+  letter-spacing: 0.01em !important;
+  padding: 6px 12px !important;
+  min-height: 0 !important;
+  line-height: 1.25 !important;
+  box-shadow: none !important;
+  cursor: default !important;
+  opacity: 1 !important;
+  margin: 0 8px 8px 0 !important;
+}
+#tl-header-tags button:hover,
+#tl-header-tags button:active,
+#tl-header-tags button:focus {
+  transform: none !important;
+  box-shadow: none !important;
 }
 
 hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 18px 0; }
@@ -921,28 +935,31 @@ theme = gr.themes.Soft(
     input_background_fill_dark="rgba(255,255,255,0.05)",
 )
 
-with gr.Blocks(title=APP_TITLE) as demo:
+with gr.Blocks(title=APP_TITLE, css=CSS) as demo:
     history_state = gr.State([])  # session-based history (last 5)
     trust_hist_state = gr.State([])
     geo_hist_state = gr.State([])
 
     with gr.Column(elem_classes=["tl-wrap"]):
-        gr.Markdown(
-            f"""
-<div class="header">
-  <h1>🚀 {APP_TITLE}</h1>
-  <p><strong>{TAGLINE}</strong></p>
-  <p>{SUBTEXT}</p>
-  <div class="tl-demo-badge" title="No external APIs. This simulates CrewAI-style orchestration.">
-    <span title="No external APIs. This simulates CrewAI-style orchestration.">🧪 Demo Mode: Simulated Multi-Agent Execution</span>
-  </div>
-  <div class="tl-badges">
-    {''.join(f'<span class="tl-badge">{html.escape(b)}</span>' for b in BADGES)}
-  </div>
-  <p>Mini analytics platform UI (simulated). No external API calls.</p>
+        with gr.Column(elem_classes=["header"]):
+            gr.Markdown(
+                f"""
+<h1>🚀 {APP_TITLE}</h1>
+<p><strong>{TAGLINE}</strong></p>
+<p>{SUBTEXT}</p>
+<div class="tl-demo-badge" title="No external APIs. This simulates CrewAI-style orchestration.">
+  <span title="No external APIs. This simulates CrewAI-style orchestration.">🧪 Demo Mode: Simulated Multi-Agent Execution</span>
 </div>
+<p>Mini analytics platform UI (simulated). No external API calls.</p>
 """.strip()
-        )
+            )
+            with gr.Row(equal_height=True, elem_id="tl-header-tags"):
+                for badge_label in BADGES:
+                    gr.Button(
+                        badge_label,
+                        interactive=False,
+                        elem_classes=["tag-btn"],
+                    )
 
         with gr.Group(elem_classes=["tl-card"]):
             gr.Markdown("### 🔎 Input")
@@ -1098,5 +1115,5 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(theme=theme, css=CSS)
+    demo.launch(theme=theme)
 
