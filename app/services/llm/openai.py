@@ -12,10 +12,12 @@ class OpenAILLM(BaseLLM):
         model: str = "gpt-4o-mini",
         base_url: str = "https://api.openai.com/v1",
         timeout_s: float = 30.0,
+        max_tokens: int = 300,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
+        self.max_tokens = int(max_tokens)
 
     def generate(self, prompt: str) -> str:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -35,6 +37,7 @@ class OpenAILLM(BaseLLM):
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_tokens,
         }
         headers = {
             "Authorization": f"Bearer {api_key}",

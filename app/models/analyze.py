@@ -19,6 +19,21 @@ class AnalyzeRequest(BaseModel):
         default="ollama",
         description='LLM provider to use (default: "ollama"). Use "all" to compare providers.',
     )
+    simulate_failure: dict[str, bool] | None = Field(
+        default=None,
+        description=(
+            "Optional demo/testing-only toggles to force specific pipeline step failures. "
+            'Example: { "retrieval": true, "ranking": false, "trust": true }.'
+        ),
+    )
+    show_debug: bool = Field(
+        default=False,
+        description="When true, include agent intermediate outputs in the response (best-effort).",
+    )
+    debug: bool = Field(
+        default=False,
+        description="Deprecated alias for show_debug (kept for older clients).",
+    )
 
 
 class AnalyzeExplanations(BaseModel):
@@ -63,6 +78,18 @@ class AnalyzeResponse(BaseModel):
     fallback_used: bool = Field(
         default=False,
         description="True when the requested provider failed and the response was served from Ollama instead.",
+    )
+    llm_valid: bool = Field(
+        default=True,
+        description="True when the provider raw output parsed via json.loads; false when fallback parsing logic was used.",
+    )
+    used_fallback: bool = Field(
+        default=False,
+        description="True when LLM output JSON parsing failed and fallback parsing/minimal payload was used.",
+    )
+    parsing_success: bool = Field(
+        default=True,
+        description="True when json.loads succeeded on the provider output (same as llm_valid).",
     )
     raw_output: str = Field(description="Raw text returned by the selected provider.")
     parsed_output: dict[str, Any] = Field(
@@ -137,6 +164,26 @@ class AnalyzeApiDebug(BaseModel):
     )
 
 
+class AgentDebugPanel(BaseModel):
+    """
+    Agent Debug Panel payload: intermediate outputs from each agent step.
+
+    This is only returned when `show_debug=true`.
+    """
+
+    retrieval: dict[str, Any] = Field(default_factory=dict)
+    ranking: dict[str, Any] = Field(default_factory=dict)
+    trust: dict[str, Any] = Field(default_factory=dict)
+    geo: dict[str, Any] = Field(default_factory=dict)
+    explanation: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTraceTimelineEntry(BaseModel):
+    agent: str = Field(description="Agent key (e.g. retrieval, ranking, trust).")
+    status: Literal["success", "fallback", "failed"] = Field(description="Execution outcome for this step.")
+    latency_ms: int = Field(ge=0, description="Step latency in milliseconds.")
+
+
 class AnalyzeApiResponse(BaseModel):
     """
     Unified `/v1/analyze` JSON shape: always includes the original query, which providers
@@ -160,8 +207,12 @@ class AnalyzeApiResponse(BaseModel):
         description="Aggregate trust when metrics are available; null for single-provider.",
     )
     explanation: AnalyzeApiExplanation
-    debug: AnalyzeApiDebug | dict[ProviderName, AnalyzeApiDebug] = Field(
-        description="Single-provider: one object. Multi-provider: map of provider name to the same fields.",
+    parse_debug: AnalyzeApiDebug | dict[ProviderName, AnalyzeApiDebug] = Field(
+        description="Parse/retry diagnostics. Single-provider: one object. Multi-provider: map of provider name to the same fields.",
+    )
+    debug: AgentDebugPanel | None = Field(
+        default=None,
+        description="Agent Debug Panel payload (only when show_debug=true).",
     )
     accuracy: float | None = Field(
         default=None,
@@ -178,6 +229,57 @@ class AnalyzeApiResponse(BaseModel):
     geo: dict[str, Any] | None = Field(
         default=None,
         description="GEO analysis payload (score + issues/recommendations) derived from the parsed ranking output.",
+    )
+    llm_valid: bool | None = Field(
+        default=None,
+        description="LLM output validity indicator for the primary provider used to compute displayed scores.",
+    )
+    used_fallback: bool | None = Field(
+        default=None,
+        description="True when fallback parsing/minimal payload was used for the primary provider.",
+    )
+    confidence_score: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Confidence calibration score (0..1) combining LLM validity, RAG context presence, and parsing success.",
+    )
+    quality_score: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Heuristic answer-quality score (0..1) derived from known-brand detection, financial keyword coverage, and RAG context presence.",
+    )
+    brand_detected: bool | None = Field(
+        default=None,
+        description="True when any ranked product includes a known financial brand substring; used to cap confidence for unknown providers.",
+    )
+    agent_outputs: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional agent-level outputs and status for the multi-agent pipeline (debug only).",
+    )
+    agent_trace: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Structured execution trace for the multi-agent pipeline. Each entry records agent start/end, "
+            "duration, success/failure, and a short output summary."
+        ),
+    )
+    trace: list[AgentTraceTimelineEntry] | None = Field(
+        default=None,
+        description="Simplified agent timeline trace for UI rendering (agent/status/latency_ms).",
+    )
+    final_output: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional unified final output (debug/clients that consume a single merged payload).",
+    )
+    error: str | None = Field(
+        default=None,
+        description="Optional top-level error message when the request partially failed.",
+    )
+    warnings: list[str] | None = Field(
+        default=None,
+        description="Optional non-fatal warnings (e.g., agent failure fallbacks) for demo/debug UI.",
     )
 
 

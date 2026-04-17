@@ -166,7 +166,10 @@ async def query_financial_llm_multi(
     settings = get_settings()
     if settings.use_llm_dev_mock:
         raw = json.dumps(_DEV_MOCK_PARSED)
-        safe_payload = parse_llm_json(raw)
+        safe_env = parse_llm_json(raw)
+        safe_payload = safe_env.get("data") if isinstance(safe_env, dict) else None
+        if not isinstance(safe_payload, dict):
+            safe_payload = {"ranked_products": []}
         sid = session_id or str(uuid4())
         response_id = str(uuid4())
         parsed_dump: str | None = None
@@ -244,7 +247,10 @@ async def query_financial_llm_multi(
                 "LLM output ignored JSON instructions after strict retry.",
             )
 
-    safe_payload = parse_llm_json(raw)
+    safe_env = parse_llm_json(raw)
+    safe_payload = safe_env.get("data") if isinstance(safe_env, dict) else None
+    if not isinstance(safe_payload, dict):
+        safe_payload = {"ranked_products": []}
 
     sid = session_id or str(uuid4())
     response_id = str(uuid4())

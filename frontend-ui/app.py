@@ -29,6 +29,15 @@ DEFAULT_API_BASE = BASE_URL
 
 Provider = Literal["ollama", "openai", "openrouter", "all"]
 
+_AGENT_ORDER: tuple[str, ...] = ("retrieval", "ranking", "trust", "analytics", "explanation")
+_AGENT_META: dict[str, dict[str, str]] = {
+    "retrieval": {"label": "Retrieval", "icon": "🔍"},
+    "ranking": {"label": "Ranking", "icon": "🧠"},
+    "trust": {"label": "Trust", "icon": "⚖️"},
+    "analytics": {"label": "Analytics", "icon": "📊"},
+    "explanation": {"label": "Explanation", "icon": "🗣️"},
+}
+
 
 def _api_base() -> str:
     return os.environ.get("TRUST_LENS_API_BASE", DEFAULT_API_BASE).rstrip("/")
@@ -60,6 +69,204 @@ def _fmt_pct(value: Any) -> str:
     if f <= 1.0:
         f *= 100.0
     return f"{f:.0f}%"
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _confidence_band(score01: float) -> str:
+    if score01 >= 0.8:
+        return "High"
+    if score01 >= 0.5:
+        return "Medium"
+    return "Low"
+
+
+def _is_errorish(agent_block: Any) -> bool:
+    if not isinstance(agent_block, dict):
+        return False
+    if agent_block.get("error"):
+        return True
+    out = agent_block.get("output")
+    return isinstance(out, dict) and bool(out.get("error"))
+
+
+def _agent_duration_s(agent_block: Any) -> float | None:
+    if not isinstance(agent_block, dict):
+        return None
+    for k in ("duration_s", "duration_sec", "elapsed_s", "time_s"):
+        v = _safe_float(agent_block.get(k))
+        if v is not None:
+            return v
+    ms = _safe_float(agent_block.get("duration_ms") or agent_block.get("elapsed_ms") or agent_block.get("time_ms"))
+    if ms is not None:
+        return ms / 1000.0
+    return None
+
+
+def _extract_agent_outputs(payload: dict[str, Any]) -> dict[str, Any] | None:
+    agent_outputs = payload.get("agent_outputs")
+    return agent_outputs if isinstance(agent_outputs, dict) else None
+
+
+def _extract_final_output(payload: dict[str, Any]) -> dict[str, Any]:
+    # New multi-agent envelope: {"final_output": {...}}
+    final_output = payload.get("final_output")
+    if isinstance(final_output, dict):
+        return final_output
+
+    # Legacy API envelope: choose first ok provider parsed_output
+    primary = _first_ok_provider_block(payload) or {}
+    parsed = primary.get("parsed_output") or {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_trust_geo(payload: dict[str, Any]) -> tuple[float | None, float | None]:
+    # New envelope: {"metrics": {"trust_score": float, "geo_score": float}}
+    metrics = payload.get("metrics")
+    if isinstance(metrics, dict):
+        t = _safe_float(metrics.get("trust_score"))
+        g = _safe_float(metrics.get("geo_score"))
+        if (t is not None) or (g is not None):
+            return t, g
+
+    # Legacy: trust_score at top-level or nested; geo at payload.geo.score
+    trust_score = payload.get("trust_score")
+    if trust_score is None:
+        trust = payload.get("trust")
+        if isinstance(trust, dict):
+            trust_score = trust.get("score")
+    geo_score = None
+    geo = payload.get("geo")
+    if isinstance(geo, dict):
+        geo_score = geo.get("score")
+    return _safe_float(trust_score), _safe_float(geo_score)
+
+
+def _render_agent_pipeline(agent_outputs: dict[str, Any]) -> None:
+    st.subheader("Agent Pipeline")
+    cols = st.columns(5)
+    for idx, agent in enumerate(_AGENT_ORDER):
+        meta = _AGENT_META.get(agent, {"label": agent.title(), "icon": "🤖"})
+        block = agent_outputs.get(agent)
+
+        status = "loading"
+        if block is None:
+            status = "skipped"
+        elif _is_errorish(block):
+            status = "failed"
+        else:
+            status = "done"
+
+        dur_s = _agent_duration_s(block)
+        with cols[idx]:
+            with st.container(border=True):
+                st.markdown(f"**{meta['icon']} {meta['label']}**")
+                if status == "done":
+                    st.success("Done")
+                elif status == "failed":
+                    st.error("Failed")
+                elif status == "skipped":
+                    st.warning("Missing")
+                else:
+                    st.info("Loading…")
+                if dur_s is not None:
+                    st.caption(f"Time: **{dur_s:.2f}s**")
+
+
+def _agent_preview(agent: str, block: Any) -> str:
+    if block is None:
+        return "—"
+    if isinstance(block, dict):
+        out = block.get("output", block)
+        if isinstance(out, dict):
+            if agent == "retrieval":
+                ctx = out.get("context") or out.get("contexts") or out.get("documents") or out.get("retrieved")
+                if isinstance(ctx, list) and ctx:
+                    first = ctx[0]
+                    if isinstance(first, dict):
+                        return str(first.get("text") or first.get("content") or first.get("snippet") or "")[:160] or "Retrieved context (list)"
+                    return str(first)[:160]
+                if isinstance(ctx, str) and ctx.strip():
+                    return ctx.strip()[:160]
+            if agent == "ranking":
+                ranked = out.get("ranked_products") or out.get("ranking") or out.get("rankings")
+                if isinstance(ranked, list) and ranked:
+                    top = ranked[0]
+                    if isinstance(top, dict):
+                        return f"Top: {top.get('name') or top.get('product') or top.get('title') or '—'}"
+                    return f"Top: {str(top)[:120]}"
+            if agent == "trust":
+                t = _safe_float(out.get("trust_score") or out.get("score"))
+                g = _safe_float(out.get("geo_score"))
+                if t is not None and g is not None:
+                    return f"trust={t:.3f}, geo={g:.3f}"
+                if t is not None:
+                    return f"trust={t:.3f}"
+            if agent == "explanation":
+                txt = out.get("explanation") or out.get("text") or out.get("reasoning") or out.get("summary")
+                if isinstance(txt, str) and txt.strip():
+                    return txt.strip()[:160]
+            if agent == "analytics":
+                for k in ("drift", "anomalies", "insights", "signals"):
+                    v = out.get(k)
+                    if v is not None:
+                        return f"{k}: {str(v)[:140]}"
+        if isinstance(out, str) and out.strip():
+            return out.strip()[:160]
+    return str(block)[:160]
+
+
+def _render_agent_details_panel(agent_outputs: dict[str, Any]) -> None:
+    with st.expander("▶ Agent Details", expanded=False):
+        for agent in _AGENT_ORDER:
+            meta = _AGENT_META.get(agent, {"label": agent.title(), "icon": "🤖"})
+            block = agent_outputs.get(agent)
+            preview = _agent_preview(agent, block)
+            status = "partial" if (block is None or _is_errorish(block)) else "ok"
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+                with left:
+                    st.markdown(f"**{meta['icon']} {meta['label']}**")
+                    st.caption(preview or "—")
+                with right:
+                    if status == "ok":
+                        st.success("OK")
+                    else:
+                        st.warning("Partial")
+
+
+def _render_agent_debug(agent_outputs: dict[str, Any]) -> None:
+    st.subheader("Agent outputs (debug)")
+    for agent in _AGENT_ORDER:
+        meta = _AGENT_META.get(agent, {"label": agent.title(), "icon": "🤖"})
+        block = agent_outputs.get(agent)
+        label = f"{meta['icon']} {meta['label']} Output"
+        with st.expander(label, expanded=False):
+            if block is None:
+                st.warning("No output for this agent (partial result).")
+                continue
+            if isinstance(block, dict) and block.get("error"):
+                st.error(str(block.get("error")))
+            out = block.get("output") if isinstance(block, dict) else block
+            if agent == "explanation":
+                if isinstance(out, dict):
+                    txt = out.get("explanation") or out.get("text") or out.get("reasoning") or out.get("summary")
+                    if isinstance(txt, str) and txt.strip():
+                        st.markdown(txt)
+                    else:
+                        st.json(out)
+                elif isinstance(out, str):
+                    st.markdown(out)
+                else:
+                    st.json(out)
+            else:
+                st.json(out if out is not None else block)
 
 
 def _api_error(msg: str) -> None:
@@ -668,24 +875,34 @@ def main() -> None:
         else:
             st.caption(f"Query: **{str(payload.get('query') or st.session_state.get('last_query') or '')[:200]}**")
 
+            agent_outputs = _extract_agent_outputs(payload)
+            if agent_outputs:
+                _render_agent_pipeline(agent_outputs)
+                _render_agent_details_panel(agent_outputs)
+                if any((_is_errorish(agent_outputs.get(a)) or agent_outputs.get(a) is None) for a in _AGENT_ORDER):
+                    st.warning("Partial result: one or more agents did not return output. Final results below may be incomplete.")
+                st.markdown("---")
+
             primary = _first_ok_provider_block(payload)
-            if not primary:
-                st.error("No successful provider result in the API response.")
-            else:
+            final_output = _extract_final_output(payload)
+            if primary or final_output:
                 st.subheader("📊 Ranked Results")
-                rankings = _rankings_from_provider_block(primary)
+                # Prefer new final_output ranking; fall back to legacy provider block.
+                rankings: list[dict[str, Any]] = []
+                ranked = final_output.get("ranked_products")
+                if isinstance(ranked, list):
+                    rankings = [x for x in ranked if isinstance(x, dict)]
+                if not rankings and primary:
+                    rankings = _rankings_from_provider_block(primary)
                 _render_rankings(rankings)
+            else:
+                st.error("No successful result in the API response.")
 
                 st.markdown("---")
                 st.subheader("🔢 Metrics")
-                # Support both legacy/object and flat/float trust payloads.
-                trust_score = payload.get("trust", None)
-                if isinstance(trust_score, dict):
-                    trust_score = trust_score.get("score")
-                if trust_score is None:
-                    trust_score = payload.get("trust_score", None)
+                trust_score, geo_score = _extract_trust_geo(payload)
                 accuracy = payload.get("accuracy") or (payload.get("metrics") or {}).get("accuracy")
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     if trust_score is not None:
                         st.metric("Trust Score", f"{round(float(trust_score) * 100, 1)}%")
@@ -695,11 +912,28 @@ def main() -> None:
                         st.write("DEBUG trust:", trust_score)
                 with col2:
                     st.metric("Accuracy Score", _fmt_pct(accuracy))
+                with col3:
+                    if geo_score is not None:
+                        st.metric("GEO Score", f"{round(float(geo_score) * 100, 1)}%")
+                    else:
+                        st.metric("GEO Score", "N/A")
+
+                confidence_score = _safe_float(payload.get("confidence_score"))
+                if confidence_score is not None:
+                    st.markdown(
+                        f"**Confidence Score:** {_fmt_pct(confidence_score)} "
+                        f"({_confidence_band(float(confidence_score))})"
+                    )
+                used_fallback = payload.get("used_fallback")
+                llm_valid = payload.get("llm_valid")
+                used_fallback_bool = bool(used_fallback) if used_fallback is not None else (llm_valid is False)
+                if used_fallback_bool:
+                    st.warning("⚠️ Fallback used due to invalid LLM output. Confidence reduced.")
 
                 st.markdown("---")
                 st.subheader("🧾 Explanation")
-                parsed = primary.get("parsed_output") or {}
-                explanation = payload.get("explanation") or parsed.get("explanation") or ""
+                parsed = (primary.get("parsed_output") if isinstance(primary, dict) else None) or {}
+                explanation = payload.get("explanation") or final_output.get("explanation") or parsed.get("explanation") or ""
                 if explanation:
                     st.write(explanation)
                 else:
@@ -770,6 +1004,8 @@ def main() -> None:
                 _render_export_section(api_base, payload)
 
             if show_debug:
+                if agent_outputs:
+                    _render_agent_debug(agent_outputs)
                 with st.expander("🐞 Debug payload", expanded=False):
                     st.json(payload)
 

@@ -3,7 +3,10 @@ import json
 import re
 from typing import Any
 
-_FALLBACK = {"ranked_products": []}
+_FALLBACK: dict[str, Any] = {
+    "ranked_products": [],
+    "explanation": "LLM output parsing failed",
+}
 
 _LOG_PREFIX = "parse_llm_json"
 
@@ -20,6 +23,25 @@ def _strip_markdown_fences(text: str) -> str:
     s = re.sub(r"```\s*json\s*", "", text, flags=re.IGNORECASE)
     s = s.replace("```", "")
     return s.strip()
+
+
+def _quote_unquoted_keys(text: str) -> str:
+    """
+    Fix common invalid-JSON output: missing quotes around object keys.
+
+    The regex is constrained to likely key positions (after `{` or `,`) to avoid
+    rewriting colons inside values.
+    """
+    # Example: `{foo: 1, bar: 2}` -> `{"foo": 1, "bar": 2}`
+    return re.sub(r'(?<=\{|,)\s*(\w+)\s*:', r'"\1":', text)
+
+
+def _strip_stray_colons(text: str) -> str:
+    """Remove a few stray-colon patterns that break json parsing."""
+    out = text
+    out = re.sub(r":\s*}", "}", out)
+    out = re.sub(r":\s*]", "]", out)
+    return out
 
 
 def _clean_llm_text(text: str) -> str:
@@ -234,81 +256,84 @@ def _try_ast_literal_eval(text: str) -> Any | None:
 def _repair_pipeline(raw: str) -> str:
     """Ordered string repairs: clean → key aliases → trailing commas."""
     s = _clean_llm_text(raw)
+    # Robustness: fix missing quotes around keys; strip a couple of stray-colon patterns.
+    s2 = _quote_unquoted_keys(s)
+    if s2 != s:
+        _log("clean", "added quotes around unquoted object keys")
+    s = _strip_stray_colons(s2)
     s = _apply_string_key_aliases(s)
     s = _strip_trailing_commas(s)
     return s
 
 
-def parse_llm_json(response: str) -> dict:
+def parse_llm_json(response: str) -> dict[str, Any]:
     """
-    Parse JSON from LLM text. Never raises: returns ``{"ranked_products": []}``
-    on failure.
+    Parse JSON from LLM text.
 
-    Cleans fences/newlines, fixes common key names and trailing commas, extracts
-    ``{...}`` by first/last brace, then tries ``json.loads`` and ``ast.literal_eval``.
+    Requirements:
+    - Extract ONLY the substring between the first '{' and the last '}'.
+    - Drop any leading / trailing text outside that span.
+    - Never raise; if parsing fails, return a minimal safe structure so the UI
+      never breaks.
     """
+    llm_valid = False
+    used_fallback = False
+    parsing_success = False  # NOTE: kept for backward compatibility; now equals llm_valid.
+
     if response is None:
         _log("fallback", "response is None")
-        return dict(_FALLBACK)
+        return {"data": dict(_FALLBACK), "llm_valid": False, "used_fallback": True, "parsing_success": False}
 
     if not isinstance(response, str):
         _log("fallback", f"expected str, got {type(response).__name__}")
-        return dict(_FALLBACK)
+        return {"data": dict(_FALLBACK), "llm_valid": False, "used_fallback": True, "parsing_success": False}
 
-    repaired = _repair_pipeline(response)
-    if not repaired.strip():
+    # Clean first (markdown fences/newlines), then extract the JSON object span only.
+    cleaned = _repair_pipeline(response)
+    if not cleaned.strip():
         _log("fallback", "empty after cleaning")
-        return dict(_FALLBACK)
+        return {"data": dict(_FALLBACK), "llm_valid": False, "used_fallback": True, "parsing_success": False}
 
-    candidates: list[str] = []
-    seen: set[str] = set()
+    slice_span = _extract_first_brace_slice(cleaned)
+    if not slice_span:
+        _log("fallback", "no JSON braces span found")
+        return {"data": dict(_FALLBACK), "llm_valid": False, "used_fallback": True, "parsing_success": False}
 
-    def add_candidate(label: str, s: str | None) -> None:
-        if not s:
-            return
-        t = s.strip()
-        if not t or t in seen:
-            return
-        seen.add(t)
-        _log("candidate", f"{label} ({len(t)} chars)")
-        candidates.append(t)
+    repaired = _repair_pipeline(slice_span)
+    if not repaired.strip():
+        _log("fallback", "empty after extraction+repairs")
+        return {"data": dict(_FALLBACK), "llm_valid": False, "used_fallback": True, "parsing_success": False}
 
-    slice_span = _extract_first_brace_slice(repaired)
-    if slice_span:
-        add_candidate("brace_slice", slice_span)
-    add_candidate("full_repaired", repaired)
+    _log("json.loads", f"attempt on extracted span ({len(repaired)} chars)")
+    try:
+        parsed = json.loads(repaired)
+        _log("json.loads", "success")
+        llm_valid = True
+        used_fallback = False
+        parsing_success = llm_valid
+        return {
+            "data": _finalize(parsed),
+            "llm_valid": llm_valid,
+            "used_fallback": used_fallback,
+            "parsing_success": parsing_success,
+        }
+    except Exception as e:  # noqa: BLE001 - json.loads can raise multiple exceptions
+        _log("json.loads", f"failed: {e}")
 
-    balanced = _first_balanced_json(repaired)
-    add_candidate("first_balanced_json", balanced)
+    # Best-effort recovery: safe Python-literal parse on a balanced slice.
+    balanced = _first_balanced_json(cleaned) or _first_balanced_object(cleaned) or repaired
+    parsed2 = _try_ast_literal_eval(balanced)
+    if parsed2 is not None:
+        _log("fallback", "json.loads failed; recovered via ast.literal_eval")
+        llm_valid = False
+        used_fallback = True
+        parsing_success = llm_valid
+        return {
+            "data": _finalize(parsed2),
+            "llm_valid": llm_valid,
+            "used_fallback": used_fallback,
+            "parsing_success": parsing_success,
+        }
 
-    balanced_obj = _first_balanced_object(repaired)
-    add_candidate("first_balanced_object", balanced_obj)
-    if balanced_obj and balanced_obj != repaired:
-        nested = _first_balanced_json(balanced_obj)
-        add_candidate("balanced_object_inner", nested)
-
-    for i, candidate in enumerate(candidates):
-        _log("json.loads", f"try candidate #{i + 1}")
-        try:
-            parsed = json.loads(candidate)
-            _log("json.loads", "success")
-            return _finalize(parsed)
-        except Exception as e:  # noqa: BLE001 - LLM output may trigger any json.loads failure
-            _log("json.loads", f"failed: {e}")
-
-    _log("recovery", "json.loads failed for all candidates; trying ast.literal_eval on primary spans")
-
-    for label, blob in (
-        ("brace_slice", slice_span),
-        ("full_repaired", repaired),
-        ("first_balanced_object", balanced_obj),
-    ):
-        if not blob:
-            continue
-        lit = _try_ast_literal_eval(blob.strip())
-        if lit is not None:
-            _log("literal_eval", f"success on {label}")
-            return _finalize(lit)
-
-    _log("fallback", "all parsing attempts failed")
-    return dict(_FALLBACK)
+    _log("fallback", "parsing failed; returning safe minimal structure")
+    return {"data": dict(_FALLBACK), "llm_valid": False, "used_fallback": True, "parsing_success": False}

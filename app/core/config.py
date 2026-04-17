@@ -34,8 +34,14 @@ class Settings(BaseSettings):
     )
     llm_model: str = Field(default="gpt-4o-mini", validation_alias="LLM_MODEL")
     llm_timeout_seconds: float = Field(default=60.0, validation_alias="LLM_TIMEOUT_SECONDS")
+    llm_max_tokens: int = Field(default=300, ge=1, le=4096, validation_alias="LLM_MAX_TOKENS")
     llm_max_retries: int = Field(default=4, ge=1, validation_alias="LLM_MAX_RETRIES")
     llm_temperature: float = Field(default=0.2, validation_alias="LLM_TEMPERATURE")
+    llm_use_explanation: bool = Field(default=False, validation_alias="LLM_USE_EXPLANATION")
+
+    # Local Ollama defaults (used when provider == "ollama" or as a fallback planner).
+    ollama_model: str = Field(default="phi3", validation_alias="OLLAMA_MODEL")
+    ollama_base_url: str = Field(default="http://localhost:11434", validation_alias="OLLAMA_BASE_URL")
 
     data_dir: Path = Field(
         default=Path("data"),

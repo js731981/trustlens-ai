@@ -14,12 +14,14 @@ class OllamaLLM(BaseLLM):
         timeout_s: float = 300.0,
         fallback_model: str | None = None,
         stream: bool = False,
+        max_tokens: int = 300,
     ) -> None:
         self.model = model
         self.fallback_model = fallback_model
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
         self.stream = bool(stream)
+        self.max_tokens = int(max_tokens)
 
     def _model_sequence(self) -> list[str]:
         seq = [self.model]
@@ -61,6 +63,7 @@ class OllamaLLM(BaseLLM):
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "stream": self.stream,
+            "options": {"num_predict": self.max_tokens},
         }
 
         try:

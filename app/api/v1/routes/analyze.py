@@ -1,10 +1,13 @@
 import json
+import asyncio
+import time
 from pathlib import Path
 from typing import Any, Iterable, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
 
+from app.crew.crew import run_trustlens_agents
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.analyze import (
@@ -18,6 +21,7 @@ from app.models.analyze import (
     AnalyzeProviderResult,
     AnalyzeRequest,
     AnalyzeResponse,
+    AgentTraceTimelineEntry,
     HistoryEntry,
     ProviderName,
 )
@@ -127,14 +131,46 @@ def _explanation_single(parsed: dict[str, Any]) -> AnalyzeApiExplanation:
     return AnalyzeApiExplanation(summary=summary, insights=insights)
 
 
-def _normalize_parsed_from_raw(raw_output: str, catalog_names: tuple[str, ...]) -> dict:
+def _normalize_parsed_from_raw(
+    raw_output: str,
+    catalog_names: tuple[str, ...],
+) -> tuple[dict[str, Any], bool, bool]:
     try:
-        parsed_output = parse_llm_json(raw_output)
+        parsed_env = parse_llm_json(raw_output)
     except Exception:
         logger.exception("parse_llm_json_unexpected")
+        parsed_env = {"data": {"ranked_products": []}, "llm_valid": False, "used_fallback": True, "parsing_success": False}
+
+    llm_valid = bool(parsed_env.get("llm_valid")) if isinstance(parsed_env, dict) else False
+    used_fallback = bool(parsed_env.get("used_fallback")) if isinstance(parsed_env, dict) else (not llm_valid)
+    parsing_success = llm_valid
+    parsed_output = parsed_env.get("data") if isinstance(parsed_env, dict) else None
+    if not isinstance(parsed_output, dict):
         parsed_output = {"ranked_products": []}
+
     normalized_output = normalize_output(parsed_output)
     validated_output = validate_products(normalized_output, catalog_names)
+    # Never allow empty ranking to propagate to UI/clients.
+    ranked = validated_output.get("ranked_products")
+    if not isinstance(ranked, list) or len(ranked) == 0:
+        validated_output["ranked_products"] = [
+            {"rank": 1, "name": "HDFC Bank Personal Loan", "notes": "Fallback"},
+            {"rank": 2, "name": "ICICI Bank Personal Loan", "notes": "Fallback"},
+        ]
+        if "explanation" not in validated_output:
+            validated_output["explanation"] = ""
+    # Optional: tag ranked products as fallback when LLM output was invalid.
+    if not llm_valid:
+        rp = validated_output.get("ranked_products")
+        if isinstance(rp, list):
+            for item in rp:
+                if not isinstance(item, dict):
+                    continue
+                notes = str(item.get("notes") or "").strip()
+                if not notes:
+                    item["notes"] = "Fallback"
+                elif "fallback" not in notes.lower():
+                    item["notes"] = f"{notes} | Fallback"
     logger.debug(
         "parsed_output=%s",
         json.dumps(parsed_output, ensure_ascii=False, default=str),
@@ -143,7 +179,7 @@ def _normalize_parsed_from_raw(raw_output: str, catalog_names: tuple[str, ...]) 
         "normalized_output=%s",
         json.dumps(normalized_output, ensure_ascii=False, default=str),
     )
-    return validated_output
+    return validated_output, llm_valid, used_fallback
 
 
 def _try_shape_analyze_response(
@@ -158,10 +194,13 @@ def _try_shape_analyze_response(
             raw_output=raw_output,
             parsed_output={},
         )
-    normalized_output = _normalize_parsed_from_raw(raw_output, catalog_names)
+    normalized_output, llm_valid, used_fallback = _normalize_parsed_from_raw(raw_output, catalog_names)
     return AnalyzeResponse(
         provider_used=result.provider_used,
         fallback_used=result.fallback_used,
+        llm_valid=llm_valid,
+        used_fallback=used_fallback,
+        parsing_success=llm_valid,
         raw_output=raw_output,
         parsed_output=normalized_output,
     )
@@ -229,6 +268,125 @@ def _rankings_from_parsed(parsed_output: dict[str, Any]) -> list[dict[str, Any]]
     return out
 
 
+def _clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+KNOWN_FINANCIAL_BRANDS: tuple[str, ...] = (
+    "hdfc",
+    "icici",
+    "sbi",
+    "axis",
+    "kotak",
+    "bajaj",
+    "idfc",
+    "pnb",
+)
+
+_FINANCIAL_KEYWORDS: tuple[str, ...] = ("bank", "loan", "insurance")
+
+
+def _brand_detected_from_ranked(parsed_output: dict[str, Any]) -> bool:
+    ranked = parsed_output.get("ranked_products")
+    if not isinstance(ranked, list):
+        return False
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        product = str(item.get("name") or "").lower()
+        if not product:
+            continue
+        if any(brand in product for brand in KNOWN_FINANCIAL_BRANDS):
+            return True
+    return False
+
+
+def _keyword_present_from_ranked(parsed_output: dict[str, Any]) -> bool:
+    ranked = parsed_output.get("ranked_products")
+    if not isinstance(ranked, list):
+        return False
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        product = str(item.get("name") or "").lower()
+        if not product:
+            continue
+        if any(k in product for k in _FINANCIAL_KEYWORDS):
+            return True
+    return False
+
+
+def _quality_score(*, parsed_output: dict[str, Any], rag_context_present: bool) -> tuple[float, bool]:
+    """
+    Credibility/quality heuristic to reduce over-confident hallucinations.
+
+    quality_score (0..1):
+    - known brand detected (any ranked product) → +0.5
+    - financial keyword present (any ranked product) → +0.3
+    - RAG context present → +0.2
+    """
+    brand_detected = _brand_detected_from_ranked(parsed_output)
+    keyword_present = _keyword_present_from_ranked(parsed_output)
+
+    score = 0.0
+    if brand_detected:
+        score += 0.5
+    if keyword_present:
+        score += 0.3
+    if rag_context_present:
+        score += 0.2
+    return _clamp01(float(score)), bool(brand_detected)
+
+
+def _confidence_score(*, llm_valid: bool, rag_context_present: bool, used_fallback: bool) -> float:
+    score = 0.0
+    if llm_valid:
+        score += 0.6
+    else:
+        score += 0.1
+
+    if rag_context_present:
+        score += 0.3
+
+    if not used_fallback:
+        score += 0.1
+
+    score = _clamp01(float(score))
+
+    if used_fallback:
+        score = min(score, 0.6)
+
+    return _clamp01(float(score))
+
+
+def _confidence_score_v2(
+    *,
+    llm_valid: bool,
+    rag_context_present: bool,
+    quality_score: float,
+    brand_detected: bool,
+    used_fallback: bool,
+) -> float:
+    confidence_score = (
+        0.4 * (1.0 if llm_valid else 0.0)
+        + 0.3 * (1.0 if rag_context_present else 0.0)
+        + 0.3 * _clamp01(float(quality_score))
+    )
+    confidence_score = _clamp01(float(confidence_score))
+
+    # Hard rules (important)
+    if not brand_detected:
+        confidence_score = min(confidence_score, 0.6)
+    if float(quality_score) < 0.4:
+        confidence_score = min(confidence_score, 0.5)
+
+    # Preserve legacy fallback safety cap.
+    if used_fallback:
+        confidence_score = min(confidence_score, 0.6)
+
+    return _clamp01(float(confidence_score))
+
+
 def _persist_analyze_run(
     *,
     query: str,
@@ -284,9 +442,248 @@ def _persist_analyze_run(
 )
 async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
     try:
+        start_time = time.time()
         query = body.query
-        intent = classify_query(query)
         settings = get_settings()
+
+        # CrewAI sequential multi-agent path (single-provider only).
+        # Kept backward compatible: we still return the existing AnalyzeApiResponse schema.
+        if body.provider != "all":
+            try:
+                unified = await asyncio.to_thread(
+                    run_trustlens_agents,
+                    query,
+                    provider=str(body.provider),
+                    simulate_failure=cast(dict[str, bool] | None, getattr(body, "simulate_failure", None)),
+                )
+
+                parsed_output = {
+                    "ranked_products": unified.get("ranking") or [],
+                    "explanation": unified.get("explanation") or "",
+                }
+                shaped_one = AnalyzeResponse(
+                    provider_used=cast(ProviderName, unified.get("provider_used") or str(body.provider)),
+                    fallback_used=bool(unified.get("fallback_used") or False),
+                    llm_valid=bool(unified.get("llm_valid")) if unified.get("llm_valid") is not None else True,
+                    used_fallback=bool(unified.get("used_fallback")) if unified.get("used_fallback") is not None else (not bool(unified.get("llm_valid"))),
+                    parsing_success=bool(unified.get("llm_valid")) if unified.get("llm_valid") is not None else True,
+                    raw_output=str(unified.get("raw_output") or ""),
+                    parsed_output=cast(dict[str, Any], parsed_output),
+                )
+
+                # Persist run into tracking_store (best-effort; same behavior as legacy path).
+                intent = classify_query(query)
+                try:
+                    rankings = _rankings_from_parsed(shaped_one.parsed_output)
+                    names = [str(x.get("name")) for x in rankings if isinstance(x, dict) and x.get("name")]
+                    persist_score = float(unified.get("trust")) if unified.get("trust") is not None else 0.0
+                    _persist_analyze_run(
+                        query=query,
+                        intent=intent,
+                        provider_mode=str(body.provider),
+                        provider_used=str(shaped_one.provider_used),
+                        trust_score=persist_score,
+                        ranking_names=names,
+                        parsed_rankings=rankings,
+                        snapshot={
+                            "accuracy": unified.get("accuracy"),
+                            "trust_score": unified.get("trust"),
+                            "agents_trace": unified.get("agents_trace"),
+                        },
+                    )
+                except Exception:
+                    logger.exception("analyze_persist_failed")
+
+                response = AnalyzeApiResponse(
+                    query=query,
+                    providers_used=[cast(ProviderName, shaped_one.provider_used)],
+                    results={cast(ProviderName, shaped_one.provider_used): shaped_one},
+                    metrics=None,
+                    trust=None,
+                    explanation=_explanation_single(shaped_one.parsed_output),
+                    parse_debug=_debug_for_result(shaped_one, False),
+                    accuracy=cast(float | None, unified.get("accuracy")),
+                    trust_score=cast(float | None, unified.get("trust")),
+                )
+                if isinstance(unified.get("warnings"), list):
+                    response.warnings = [str(x) for x in unified.get("warnings") if str(x).strip()]
+                # Confidence calibration for Crew path.
+                rag_present = True
+                trace = unified.get("agents_trace")
+                if isinstance(trace, list):
+                    for item in trace:
+                        if isinstance(item, dict) and str(item.get("agent")) == "retrieval":
+                            out = item.get("output")
+                            docs = out.get("retrieved_documents") if isinstance(out, dict) else None
+                            rag_present = isinstance(docs, list) and len(docs) > 0
+                            break
+                response.llm_valid = bool(shaped_one.llm_valid)
+                response.used_fallback = bool(getattr(shaped_one, "used_fallback", (not bool(shaped_one.llm_valid))))
+                qs, brand_detected = _quality_score(
+                    parsed_output=cast(dict[str, Any], shaped_one.parsed_output),
+                    rag_context_present=bool(rag_present),
+                )
+                response.quality_score = float(qs)
+                response.brand_detected = bool(brand_detected)
+                response.confidence_score = _confidence_score_v2(
+                    llm_valid=bool(shaped_one.llm_valid),
+                    rag_context_present=bool(rag_present),
+                    quality_score=float(qs),
+                    brand_detected=bool(brand_detected),
+                    used_fallback=bool(getattr(shaped_one, "used_fallback", (not bool(shaped_one.llm_valid)))),
+                )
+                trace_structured = unified.get("agent_trace")
+                if isinstance(trace_structured, list):
+                    response.agent_trace = trace_structured
+
+                # Simplified UI timeline trace (agent/status/latency_ms).
+                try:
+                    agent_trace_entries = unified.get("agent_trace") if isinstance(unified.get("agent_trace"), list) else []
+                    agents_trace_outputs = unified.get("agents_trace") if isinstance(unified.get("agents_trace"), list) else []
+                    retrieval_output = None
+                    ranking_output = None
+                    if isinstance(agents_trace_outputs, list):
+                        for item in agents_trace_outputs:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("agent")) == "retrieval":
+                                retrieval_output = item.get("output")
+                            if str(item.get("agent")) == "ranking":
+                                ranking_output = item.get("output")
+                    retrieval_source = None
+                    if isinstance(retrieval_output, dict):
+                        retrieval_source = str(retrieval_output.get("catalog_source") or "").strip().lower() or None
+                    ranking_used_fallback = False
+                    if isinstance(ranking_output, dict):
+                        ranking_used_fallback = bool(ranking_output.get("used_fallback") or False)
+
+                    timeline: list[AgentTraceTimelineEntry] = []
+                    for entry in agent_trace_entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        agent = str(entry.get("agent") or "").strip().lower()
+                        if not agent:
+                            continue
+                        ok = bool(entry.get("success")) if "success" in entry else True
+                        dur_ms_raw = entry.get("duration_ms")
+                        try:
+                            latency_ms = int(dur_ms_raw) if dur_ms_raw is not None else 0
+                        except Exception:
+                            latency_ms = 0
+
+                        if not ok:
+                            status_label: str = "failed"
+                        elif agent == "retrieval" and retrieval_source in ("mock", "static_file"):
+                            status_label = "fallback"
+                        elif agent == "ranking" and ranking_used_fallback:
+                            status_label = "fallback"
+                        else:
+                            status_label = "success"
+
+                        timeline.append(
+                            AgentTraceTimelineEntry(
+                                agent=agent,
+                                status=cast(Any, status_label),
+                                latency_ms=max(0, latency_ms),
+                            )
+                        )
+                    if timeline:
+                        response.trace = timeline
+                except Exception:
+                    logger.exception("analyze_trace_build_failed")
+
+                show_debug = bool(getattr(body, "show_debug", False) or getattr(body, "debug", False))
+                if show_debug:
+                    trace = unified.get("agents_trace")
+                    if isinstance(trace, list):
+                        response.agent_outputs = {str(x.get("agent")): {"output": x.get("output")} for x in trace if isinstance(x, dict)}
+                    final_output = unified.get("final_output")
+                    response.final_output = final_output if isinstance(final_output, dict) else None
+                    debug_panel = unified.get("debug")
+                    if isinstance(debug_panel, dict):
+                        response.debug = debug_panel  # pydantic will validate/coerce to AgentDebugPanel
+                # GEO: prefer explicit trust agent output (stable across trace ordering/length).
+                geo_payload = None
+                trace = unified.get("agents_trace")
+                if isinstance(trace, list):
+                    for item in trace:
+                        if not isinstance(item, dict):
+                            continue
+                        if str(item.get("agent")) != "trust":
+                            continue
+                        out = item.get("output")
+                        if isinstance(out, dict) and isinstance(out.get("geo"), dict):
+                            geo_payload = out.get("geo")
+                        break
+                if isinstance(geo_payload, dict):
+                    response.geo = geo_payload
+                else:
+                    # CrewAI pipeline already ran retrieval; treat that as "RAG context exists" for GEO boosts.
+                    response.geo = analyze_geo(shaped_one.parsed_output, rag_has_context=True, llm_valid=bool(shaped_one.llm_valid))
+
+                return response
+            except Exception as e:
+                logger.exception("Crew failed, returning partial response")
+                # Return a valid (but empty) single-provider response instead of falling back.
+                provider_used = cast(ProviderName, str(body.provider))
+                empty_parsed = {"ranked_products": [], "explanation": "System fallback triggered."}
+                shaped_one = AnalyzeResponse(
+                    provider_used=provider_used,
+                    fallback_used=True,
+                    llm_valid=False,
+                    used_fallback=True,
+                    parsing_success=False,
+                    raw_output="",
+                    parsed_output=cast(dict[str, Any], empty_parsed),
+                )
+                response = AnalyzeApiResponse(
+                    query=query,
+                    providers_used=[provider_used],
+                    results={provider_used: shaped_one},
+                    metrics=None,
+                    trust=None,
+                    explanation=_explanation_single(shaped_one.parsed_output),
+                    parse_debug=_debug_for_result(shaped_one, False),
+                    accuracy=None,
+                    trust_score=0.0,
+                    geo=analyze_geo(shaped_one.parsed_output, rag_has_context=True, llm_valid=False),
+                )
+                response.llm_valid = False
+                response.used_fallback = True
+                qs, brand_detected = _quality_score(
+                    parsed_output=cast(dict[str, Any], shaped_one.parsed_output),
+                    rag_context_present=True,
+                )
+                response.quality_score = float(qs)
+                response.brand_detected = bool(brand_detected)
+                response.confidence_score = _confidence_score_v2(
+                    llm_valid=False,
+                    rag_context_present=True,
+                    quality_score=float(qs),
+                    brand_detected=bool(brand_detected),
+                    used_fallback=True,
+                )
+                response.error = str(e)
+                response.warnings = ["⚠ Pipeline failed → system fallback used"]
+                show_debug = bool(getattr(body, "show_debug", False) or getattr(body, "debug", False))
+                if show_debug:
+                    response.agent_outputs = {
+                        "retrieval": None,
+                        "ranking": None,
+                        "trust": None,
+                        "analytics": None,
+                        "explanation": None,
+                    }
+                    response.final_output = {
+                        "ranked_products": [],
+                        "trust_score": 0.0,
+                        "geo_score": 0.0,
+                        "explanation": "System fallback triggered.",
+                        "error": str(e),
+                    }
+                return response
+
+        intent = classify_query(query)
         catalog_path = _ranking_catalog_path(intent, settings.data_dir)
         rag_ctx = await rag_client.fetch_rag_context_for_query(query, settings)
         if rag_ctx is not None:
@@ -409,20 +806,61 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
                     summary=explained["summary"],
                     insights=list(explained["insights"]),
                 ),
-                debug=debug_payload,
+                parse_debug=debug_payload,
                 accuracy=gt_accuracy,
                 trust_score=gt_trust_score,
             )
             # GEO: compute from the first successful provider's parsed output (stable + backward compatible).
             geo_result: dict[str, Any] | None = None
+            primary_llm_valid = None
+            primary_used_fallback = None
             for prov in providers_used:
                 entry = shaped.get(prov)
                 if isinstance(entry, AnalyzeResponse):
-                    geo_result = analyze_geo(entry.parsed_output)
+                    geo_result = analyze_geo(
+                        entry.parsed_output,
+                        rag_has_context=rag_ctx is not None,
+                        llm_valid=bool(entry.llm_valid),
+                    )
+                    primary_llm_valid = bool(entry.llm_valid)
+                    primary_used_fallback = bool(getattr(entry, "used_fallback", (not bool(entry.llm_valid))))
                     break
             if geo_result is None:
-                geo_result = analyze_geo({"ranked_products": [], "explanation": ""})
+                geo_result = analyze_geo(
+                    {"ranked_products": [], "explanation": ""},
+                    rag_has_context=rag_ctx is not None,
+                    llm_valid=False,
+                )
             response.geo = geo_result
+            # Reliability-aware scoring calibration (primary provider).
+            llm_valid = bool(primary_llm_valid) if primary_llm_valid is not None else False
+            response.llm_valid = llm_valid
+            used_fallback = bool(primary_used_fallback) if primary_used_fallback is not None else (not llm_valid)
+            response.used_fallback = used_fallback
+            primary_parsed: dict[str, Any] = {"ranked_products": []}
+            for prov in providers_used:
+                entry = shaped.get(prov)
+                if isinstance(entry, AnalyzeResponse) and isinstance(entry.parsed_output, dict):
+                    primary_parsed = entry.parsed_output
+                    break
+            qs, brand_detected = _quality_score(
+                parsed_output=primary_parsed,
+                rag_context_present=rag_ctx is not None,
+            )
+            response.quality_score = float(qs)
+            response.brand_detected = bool(brand_detected)
+            response.confidence_score = _confidence_score_v2(
+                llm_valid=llm_valid,
+                rag_context_present=rag_ctx is not None,
+                quality_score=float(qs),
+                brand_detected=bool(brand_detected),
+                used_fallback=used_fallback,
+            )
+            if not llm_valid:
+                if response.trust is not None:
+                    response.trust.score = _clamp01(float(response.trust.score) * 0.5)
+                if response.trust_score is not None:
+                    response.trust_score = _clamp01(float(response.trust_score) * 0.5)
             try:
                 save_query(
                     {
@@ -480,12 +918,34 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeApiResponse:
             metrics=None,
             trust=None,
             explanation=_explanation_single(shaped_one.parsed_output),
-            debug=_debug_for_result(shaped_one, repair_applied),
+            parse_debug=_debug_for_result(shaped_one, repair_applied),
             accuracy=gt_accuracy,
             trust_score=gt_trust_score,
         )
-        geo_result = analyze_geo(shaped_one.parsed_output)
+        geo_result = analyze_geo(
+            shaped_one.parsed_output,
+            rag_has_context=rag_ctx is not None,
+            llm_valid=bool(shaped_one.llm_valid),
+        )
         response.geo = geo_result
+        response.llm_valid = bool(shaped_one.llm_valid)
+        response.used_fallback = bool(getattr(shaped_one, "used_fallback", (not bool(shaped_one.llm_valid))))
+        qs, brand_detected = _quality_score(
+            parsed_output=cast(dict[str, Any], shaped_one.parsed_output),
+            rag_context_present=rag_ctx is not None,
+        )
+        response.quality_score = float(qs)
+        response.brand_detected = bool(brand_detected)
+        response.confidence_score = _confidence_score_v2(
+            llm_valid=bool(shaped_one.llm_valid),
+            rag_context_present=rag_ctx is not None,
+            quality_score=float(qs),
+            brand_detected=bool(brand_detected),
+            used_fallback=bool(getattr(shaped_one, "used_fallback", (not bool(shaped_one.llm_valid)))),
+        )
+        if not shaped_one.llm_valid:
+            if response.trust_score is not None:
+                response.trust_score = _clamp01(float(response.trust_score) * 0.5)
         try:
             save_query(
                 {
