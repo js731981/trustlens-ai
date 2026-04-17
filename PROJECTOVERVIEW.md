@@ -2,6 +2,10 @@
 
 This document describes what the system does, how the pieces fit together, and where to change behavior. It complements **README.md**, which covers installation and day-to-day commands.
 
+## MVP update (2026-04-17)
+
+- **`hf_space/`** — Standalone **[Hugging Face Space](https://huggingface.co/spaces/js731981/trustlens-ai)** (Gradio) for a **browser-only simulated** multi-agent flow (retrieval-style step → ranking → trust → GEO-style heuristic scoring → explanation), with a streamed execution trace, session trend charts, optional **“Simulate Agent Failure”**, and a clear **demo / simulated** badge. Logic lives in `hf_space/utils.py` (`simulate_agents`); UI and streaming in `hf_space/app.py`. Dependencies are **`gradio`** and **`matplotlib`** only (`hf_space/requirements.txt`); no FastAPI, SQLite, Qdrant, or real LLM calls. For local run and Space publish steps, see **`hf_space/README.md`**.
+
 ## Problem statement
 
 Large language models are useful for generating ranked recommendations and natural-language rationales, but their outputs are **stochastic**, **hard to validate**, and **inconsistent across models**. Trust Lens wraps LLM calls in a small **decision-support pipeline**: fixed product catalogs, structured JSON expectations, parsing and validation, optional **multi-model comparison**, and **quantitative trust signals** derived from agreement between rankings.
@@ -112,6 +116,7 @@ flowchart LR
 | `app/models/` | Pydantic models for API contracts. |
 | `data/insurance_products.json`, `data/loan_providers.json` | Catalogs whose **names** are injected into prompts and used to validate returned products. |
 | `streamlit_app.py` | Calls `POST /v1/analyze` with a single provider and visualizes the response (including metrics/trust when provider `"all"` is used via API). |
+| `hf_space/` | Gradio Hugging Face Space: simulated trust/GEO demo (`app.py`, `utils.py`); not wired to the main API (see MVP update above). |
 | `rag-service/` | Optional standalone FastAPI app: exposes `POST /index`, `POST /search`, `GET /health`. Intended as the HTTP target for `RAG_SERVICE_BASE_URL` when you want analyze to use retrieval instead of only static JSON names. |
 
 ## Request flow: `POST /v1/analyze`

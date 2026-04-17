@@ -11,6 +11,10 @@ Trust Lens is a **FastAPI** service that asks large language models (LLMs) to ra
 
 A **Streamlit** demo calls the analyze API and visualizes rankings and cross-model metrics.
 
+## What’s new in this MVP (2026-04-17)
+
+- **`hf_space/`** — Gradio app for the **[live Hugging Face Space](https://huggingface.co/spaces/js731981/trustlens-ai)**: fully **simulated** in-browser pipeline (trust + GEO-style scores, trace, charts, optional failure simulation). Uses only **`gradio`** and **`matplotlib`**; it does **not** call the FastAPI backend or real LLMs. Run locally: `cd hf_space`, `pip install -r requirements.txt`, `python app.py`. Full behavior and publish notes: **`hf_space/README.md`**.
+
 ## Features
 
 - **Multi-provider LLM ranking** — Ollama (local), OpenAI, OpenRouter; optional parallel `"all"` comparison.
@@ -119,6 +123,7 @@ Full request and response models are defined in `app/models/` and exposed in Ope
 - `data/` — Product catalogs used in prompts and `/index`.
 - `rag-service/` — Optional standalone FastAPI + Qdrant RAG API (`POST /search` consumed by the main app’s analyze flow).
 - `streamlit_app.py` — Demo dashboard (root of repo).
+- `hf_space/` — Gradio Space (simulated public demo; see “What’s new in this MVP” above).
 - `frontend-ui/` — Additional Streamlit copy / layout variant (if present in your checkout).
 
 For architecture, data flow, trust formulas, and extension points, see **[PROJECTOVERVIEW.md](PROJECTOVERVIEW.md)**.
@@ -135,6 +140,8 @@ Full Stack Data Engineer | AI Engineer
 Passionate about building AI-driven systems for real-world financial intelligence and decisioning.
 
 ## Live Demo
+
+Public **simulated** demo (Gradio Space from `hf_space/`):  
 https://huggingface.co/spaces/js731981/trustlens-ai
 
 ## Disclaimer

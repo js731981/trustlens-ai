@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import random
 import time
 from typing import Any
 
@@ -8,12 +9,14 @@ import gradio as gr
 import matplotlib
 import matplotlib.pyplot as plt
 
-from utils import run_trustlens
+from utils import simulate_agents
 
 matplotlib.use("Agg")
 
 APP_TITLE = "TrustLens AI"
-TAGLINE = "LLM Trust & GEO Intelligence"
+TAGLINE = "Multi-Agent Trust & GEO Intelligence (Simulated CrewAI-style)"
+SUBTEXT = "Agents collaborate to retrieve, rank, score trust/GEO, and explain decisions — fully simulated in-browser."
+BADGES = ["CrewAI", "RAG (Qdrant)", "Multi-Agent", "Decision Intelligence"]
 
 CSS = """
 :root {
@@ -62,6 +65,19 @@ CSS = """
 }
 .header h1 { color: white; margin: 0; font-size: 30px; font-weight: 800; letter-spacing: -0.02em; }
 .header p { color: #dbeafe; margin: 4px 0 0 0; }
+.tl-badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.tl-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.28);
+  background: rgba(255,255,255,0.14);
+  color: rgba(255,255,255,0.95);
+  font-weight: 800;
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
 
 hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 18px 0; }
 .tl-divider { border-top: 1px solid rgba(255,255,255,0.08); margin: 14px 0 18px; }
@@ -120,6 +136,7 @@ hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 18px 0;
 }
 .tl-bar.trust > div { background: linear-gradient(90deg, #22c55e, #14b8a6); }
 .tl-bar.geo > div { background: linear-gradient(90deg, #3b82f6, #22c55e); }
+.tl-bar.conf > div { background: linear-gradient(90deg, #a855f7, #6366f1); }
 .tl-metric-sub { margin-top: 8px; color: rgba(255,255,255,0.70); font-weight: 700; font-size: 0.94rem; }
 
 .gradio-container textarea,
@@ -146,6 +163,50 @@ hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 18px 0;
 }
 .gradio-container button:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(0,0,0,0.22); }
 .gradio-container button:active { transform: translateY(0px); box-shadow: 0 4px 14px rgba(0,0,0,0.18); }
+
+/* Loading panel */
+.tl-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.03);
+  color: rgba(255,255,255,0.90);
+  font-weight: 800;
+}
+.tl-spinner {
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 2px solid rgba(255,255,255,0.22);
+  border-top-color: rgba(255,255,255,0.92);
+  animation: tlspin 0.9s linear infinite;
+  flex: 0 0 auto;
+}
+@keyframes tlspin { to { transform: rotate(360deg); } }
+.tl-loading-sub { color: rgba(255,255,255,0.70); font-weight: 750; }
+
+/* System mode badge near Analyze button */
+.tl-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.90);
+  font-weight: 900;
+  font-size: 12px;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.tl-mode-badge.llm { border-color: rgba(59,130,246,0.55); background: rgba(59,130,246,0.14); }
+.tl-mode-badge.hybrid { border-color: rgba(34,197,94,0.55); background: rgba(34,197,94,0.14); }
+.tl-mode-badge.fallback { border-color: rgba(234,179,8,0.55); background: rgba(234,179,8,0.14); }
 
 /* Dark history table (custom HTML) */
 .tl-history {
@@ -184,11 +245,142 @@ hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 18px 0;
 .tl-history-query { color: rgba(255,255,255,0.92); font-weight: 750; }
 .tl-history-num { font-variant-numeric: tabular-nums; font-weight: 850; }
 .tl-history-muted { color: rgba(255,255,255,0.70); }
+
+/* Minimal execution trace timeline */
+.tl-trace {
+  margin-top: 6px;
+  padding-left: 10px;
+  border-left: 2px solid rgba(255,255,255,0.10);
+}
+.tl-trace-item {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 0 8px 14px;
+}
+.tl-trace-item::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 16px;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.18);
+  border: 2px solid rgba(255,255,255,0.18);
+}
+.tl-trace-item.success::before { background: var(--tl-green); border-color: var(--tl-green); }
+.tl-trace-item.fallback::before { background: var(--tl-yellow); border-color: var(--tl-yellow); }
+.tl-trace-item.failed::before { background: var(--tl-red); border-color: var(--tl-red); }
+.tl-trace-label { font-weight: 850; color: rgba(255,255,255,0.92); }
+.tl-trace-ms { margin-left: auto; color: rgba(255,255,255,0.70); font-weight: 800; font-variant-numeric: tabular-nums; }
+.tl-trace-icon { width: 18px; display: inline-flex; justify-content: center; }
+
+/* Yellow warning banner + badges (fallback results) */
+.tl-banner-warning {
+  border: 1px solid rgba(234, 179, 8, 0.35);
+  background: rgba(234, 179, 8, 0.12);
+  color: rgba(255,255,255,0.92);
+  border-radius: 14px;
+  padding: 12px 14px;
+  font-weight: 800;
+}
+.tl-banner-warning strong { color: #fef08a; }
+.tl-fallback-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  margin-left: 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  background: rgba(234, 179, 8, 0.14);
+  color: rgba(255,255,255,0.92);
+  font-weight: 900;
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
+
+.tl-demo-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.14);
+  color: rgba(255,255,255,0.95);
+  font-weight: 900;
+  font-size: 13px;
+  max-width: 100%;
+}
+.tl-demo-badge span[title] { cursor: help; border-bottom: 1px dotted rgba(255,255,255,0.35); }
+
+.tl-breakdown {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.03);
+  color: rgba(255,255,255,0.86);
+  font-weight: 650;
+  font-size: 0.94rem;
+  line-height: 1.45;
+}
+.tl-breakdown h4 { margin: 0 0 8px 0; font-size: 0.98rem; color: rgba(255,255,255,0.95); }
+.tl-breakdown ul { margin: 0; padding-left: 18px; }
+.tl-breakdown li { margin: 4px 0; }
 """
 
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _interpret_trust_pct(pct: int) -> tuple[str, str]:
+    """
+    Trust Score thresholds (inclusive):
+    0–40 → Low Trust 🔴
+    40–70 → Medium Trust 🟡
+    70–100 → High Trust 🟢
+    """
+    p = max(0, min(100, int(pct)))
+    if p >= 70:
+        return "🟢", "High Trust"
+    if p >= 40:
+        return "🟡", "Medium Trust"
+    return "🔴", "Low Trust"
+
+
+def _interpret_geo_pct(pct: int) -> tuple[str, str]:
+    """
+    GEO Score thresholds (inclusive):
+    0–40 → Low Coverage
+    40–70 → Moderate Coverage
+    70–100 → High Coverage
+    """
+    p = max(0, min(100, int(pct)))
+    if p >= 70:
+        return "🟢", "High Coverage"
+    if p >= 40:
+        return "🟡", "Moderate Coverage"
+    return "🔴", "Low Coverage"
+
+
+def _metric_interpretation_line(name: str, pct: int, kind: str) -> tuple[str, str]:
+    """
+    Returns (emoji_for_title, display_line).
+    Example: "Trust Score: 80% (High Trust 🟢)"
+    """
+    if kind == "trust":
+        emoji, label = _interpret_trust_pct(pct)
+        return emoji, f"{name}: {pct}% ({label} {emoji})"
+    if kind == "geo":
+        emoji, label = _interpret_geo_pct(pct)
+        return emoji, f"{name}: {pct}% ({label} {emoji})"
+    return "•", f"{name}: {pct}%"
 
 
 def _score_tier(score_0_to_1: float) -> tuple[str, str]:
@@ -203,42 +395,141 @@ def _score_tier(score_0_to_1: float) -> tuple[str, str]:
 def _metric_html(name: str, score_0_to_1: float, kind: str) -> str:
     s = _clamp01(score_0_to_1)
     pct = int(round(s * 100))
-    emoji, tier = _score_tier(s)
+    emoji, line = _metric_interpretation_line(name, pct, kind)
     return "\n".join(
         [
             '<div class="tl-metric">',
             f'  <div class="tl-metric-top"><div class="tl-metric-name">{emoji} {name}</div><div class="tl-metric-val">{pct}%</div></div>',
             f'  <div class="tl-bar {kind}"><div style="width: {pct}%;"></div></div>',
-            f'  <div class="tl-metric-sub">{tier} {name}</div>',
+            f'  <div class="tl-metric-sub">{line}</div>',
             "</div>",
         ]
     )
 
 
 def _pair_label(trust: float, geo: float) -> str:
-    _t_emoji, t_tier = _score_tier(trust)
-    _g_emoji, g_tier = _score_tier(geo)
-    return f"{t_tier} Trust / {g_tier} GEO"
+    t_pct = int(round(_clamp01(trust) * 100))
+    g_pct = int(round(_clamp01(geo) * 100))
+    _t_emoji, t_label = _interpret_trust_pct(t_pct)
+    _g_emoji, g_label = _interpret_geo_pct(g_pct)
+    return f"{t_label} / {g_label}"
 
 
-def _format_ranking_top3(ranking: list[str]) -> str:
+def _format_ranking_top3(ranking: list[str], *, is_fallback: bool = False) -> str:
     items = [str(x).strip() for x in (ranking or []) if str(x or "").strip()]
     if not items:
         return "_No results yet._"
     medals = ["🥇", "🥈", "🥉"]
     lines: list[str] = []
     for i, name in enumerate(items[:3]):
-        lines.append(f"{medals[i]} **{name}**")
+        badge = " <span class='tl-fallback-badge'>⚠ Fallback</span>" if is_fallback else ""
+        lines.append(f"{medals[i]} **{name}**{badge}")
     return "\n".join(lines).strip()
 
 
+def _format_ranking_detailed(
+    ranking: list[str],
+    product_notes: dict[str, str] | None,
+    *,
+    is_fallback: bool = False,
+) -> str:
+    items = [str(x).strip() for x in (ranking or []) if str(x or "").strip()]
+    if not items:
+        return "_No results yet. Run **Analyze** to simulate retrieval + ranking._"
+    notes = product_notes or {}
+    lines: list[str] = []
+    for i, name in enumerate(items):
+        badge = " <span class='tl-fallback-badge'>⚠ Fallback</span>" if is_fallback and i == 0 else ""
+        note = (notes.get(name) or "").strip()
+        lead = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"**{i+1}.**"
+        if note:
+            safe = html.escape(note)
+            lines.append(f"{lead} **{name}**{badge}  \n_{safe}_")
+        else:
+            lines.append(f"{lead} **{name}**{badge}")
+    return "\n\n".join(lines).strip()
+
+
+def _interpret_confidence_pct(pct: int) -> tuple[str, str]:
+    p = max(0, min(100, int(pct)))
+    if p >= 90:
+        return "🟢", "High"
+    if p >= 60:
+        return "🟡", "Medium"
+    return "🔴", "Low"
+
+
+def _confidence_metric_html(score_0_to_100: float) -> str:
+    pct = max(0, min(100, int(round(float(score_0_to_100)))))
+    emoji, label = _interpret_confidence_pct(pct)
+    frac = pct / 100.0
+    line = f"Confidence: {pct}% ({label} {emoji})"
+    return "\n".join(
+        [
+            '<div class="tl-metric">',
+            f'  <div class="tl-metric-top"><div class="tl-metric-name">{emoji} Confidence</div>'
+            f'<div class="tl-metric-val">{pct}%</div></div>',
+            f'  <div class="tl-bar conf"><div style="width: {pct}%;"></div></div>',
+            f'  <div class="tl-metric-sub">{html.escape(line)}</div>',
+            "</div>",
+        ]
+    )
+
+
+def _breakdown_html(trust_bd: dict[str, Any] | None, geo_bd: dict[str, Any] | None) -> str:
+    def rows(d: dict[str, Any] | None, title: str) -> str:
+        if not d:
+            return ""
+        parts = [f"<h4>{html.escape(title)}</h4>", "<ul>"]
+        for k, v in d.items():
+            try:
+                pts = int(v)
+            except Exception:
+                pts = 0
+            parts.append(f"<li><strong>{html.escape(str(k))}:</strong> +{pts}</li>")
+        parts.append("</ul>")
+        return "\n".join(parts)
+
+    t = rows(trust_bd, "Trust score breakdown")
+    g = rows(geo_bd, "GEO score breakdown")
+    if not t and not g:
+        return "<div class='tl-breakdown tl-foot'>—</div>"
+    return f'<div class="tl-breakdown">{t}{g}</div>'
+
+
+def _agent_failure_banner_html(agent_failed: bool, failed_key: str | None) -> str:
+    if not agent_failed or not (failed_key or "").strip():
+        return ""
+    label = str(failed_key).strip().title()
+    return (
+        "<div class='tl-banner-warning'>"
+        f"<strong>⚠</strong> Simulated agent failure: <strong>{html.escape(label)}</strong> — "
+        "pipeline continued with fallback signals."
+        "</div>"
+    )
+
+
+def _fallback_banner_html(is_fallback: bool) -> str:
+    if not is_fallback:
+        return ""
+    return (
+        "<div class='tl-banner-warning'>"
+        "<strong>⚠</strong> Some results generated using fallback logic due to LLM/RAG limitations."
+        "</div>"
+    )
+
+
 def _plot_trend(values: list[float], title: str, color: str):
-    vals = [float(v) for v in (values or [])][:4]
+    vals = [max(0.0, min(1.0, float(v))) for v in (values or [])]
     if len(vals) < 4:
-        vals = (vals + [0.0, 0.0, 0.0, 0.0])[:4]
+        pad_rng = random.Random(17)
+        while len(vals) < 4:
+            anchor = vals[-1] if vals else pad_rng.uniform(0.52, 0.72)
+            vals.append(max(0.08, min(0.95, anchor + pad_rng.uniform(-0.06, 0.06))))
+    vals = vals[-4:]
 
     x = [1, 2, 3, 4]
-    y = [max(0.0, min(1.0, v)) * 100.0 for v in vals]
+    y = [v * 100.0 for v in vals]
 
     fig, ax = plt.subplots(figsize=(5.2, 2.6), dpi=140)
     fig.patch.set_alpha(0)
@@ -316,60 +607,297 @@ def render_history_table(history: list[dict[str, Any]]) -> str:
     )
 
 
-def begin_run(query: str) -> tuple[gr.update, str]:
+def _trace_html(trace: Any) -> str:
+    """
+    Render API response field `trace` as a minimal vertical timeline.
+    Accepts a list of dicts (preferred) or a list of strings.
+    """
+    items: list[dict[str, Any]] = []
+    if isinstance(trace, list):
+        for t in trace:
+            if isinstance(t, dict):
+                items.append(t)
+            elif isinstance(t, str):
+                items.append({"name": t})
+
+    def norm_status(x: Any) -> str:
+        s = str(x or "").strip().lower()
+        if s in {"success", "ok", "pass", "passed"}:
+            return "success"
+        if s in {"fallback", "warn", "warning", "degraded"}:
+            return "fallback"
+        if s in {"failed", "fail", "error", "err"}:
+            return "failed"
+        return "success"
+
+    def icon_for(st: str) -> str:
+        if st == "success":
+            return "✔"
+        if st == "fallback":
+            return "⚠"
+        return "✖"
+
+    if not items:
+        return "<div class='tl-trace tl-foot'>—</div>"
+
+    rows: list[str] = ["<div class='tl-trace'>"]
+    for it in items:
+        name = html.escape(str(it.get("name") or it.get("agent") or it.get("step") or "Agent"))
+        st = norm_status(it.get("status"))
+        ms_raw = it.get("duration_ms", it.get("ms", it.get("latency_ms")))
+        ms = ""
+        try:
+            if ms_raw is not None and ms_raw != "":
+                ms = f"{int(float(ms_raw))} ms"
+        except Exception:
+            ms = ""
+        rows.append(
+            "\n".join(
+                [
+                    f"<div class='tl-trace-item {st}'>",
+                    f"  <span class='tl-trace-icon'>{icon_for(st)}</span>",
+                    f"  <span class='tl-trace-label'>{name}</span>",
+                    f"  <span class='tl-trace-ms'>{html.escape(ms) if ms else ''}</span>",
+                    "</div>",
+                ]
+            )
+        )
+    rows.append("</div>")
+    return "\n".join(rows)
+
+
+def begin_run(query: str) -> tuple[gr.update, str, gr.update]:
     q = (query or "").strip()
     if not q:
-        return gr.update(interactive=True), "⚠️ Please enter a query to analyze."
-    return gr.update(interactive=False), ""
+        return gr.update(interactive=True), "⚠️ Please enter a query to analyze.", gr.update(visible=False)
+    return (
+        gr.update(interactive=False),
+        "Agents are working... orchestrating the multi-agent pipeline.",
+        gr.update(visible=True),
+    )
 
 
-def end_run() -> gr.update:
-    return gr.update(interactive=True)
+def end_run() -> tuple[gr.update, gr.update]:
+    return gr.update(interactive=True), gr.update(visible=False)
 
 
-def analyze_ui(query: str, history_state: list[dict[str, Any]]):
+def _mode_badge_html(mode: str) -> str:
+    m = (mode or "").strip()
+    cls = "llm"
+    label = "LLM Mode"
+    if m == "Hybrid Mode":
+        cls = "hybrid"
+        label = "Hybrid Mode (LLM + RAG)"
+    elif m == "Fallback Mode":
+        cls = "fallback"
+        label = "Fallback Mode"
+    return f"<span class='tl-mode-badge {cls}'>🧩 {html.escape(label)}</span>"
+
+
+def _infer_mode_from_debug(debug: dict[str, Any]) -> str:
+    """
+    Mode precedence:
+      - If fallback triggered -> Fallback Mode
+      - Else if RAG used -> Hybrid Mode
+      - Else -> LLM Mode
+    """
+    retrieval = debug.get("retrieval_output") if isinstance(debug, dict) else None
+    if not isinstance(retrieval, dict):
+        return "LLM Mode"
+
+    notes = str(retrieval.get("notes") or "").strip()
+    if notes == "Fallback":
+        return "Fallback Mode"
+
+    retrieved_docs = retrieval.get("retrieved_documents")
+    rag_used = bool(retrieved_docs) and isinstance(retrieved_docs, list)
+    return "Hybrid Mode" if rag_used else "LLM Mode"
+
+
+def _pretty_json_payload(x: Any) -> Any:
+    """
+    Return a JSON-friendly payload for `gr.JSON`.
+    If `x` is a plain string, wrap it so it still renders nicely as JSON.
+    """
+    if x is None:
+        return {}
+    if isinstance(x, str):
+        return {"text": x}
+    return x
+
+
+def toggle_debug(show: bool):
+    v = bool(show)
+    return (gr.update(visible=v),) * 5
+
+
+def _alerts_html(is_fallback: bool, agent_failed: bool, failed_key: str | None) -> str:
+    return (_agent_failure_banner_html(agent_failed, failed_key) + _fallback_banner_html(is_fallback)).strip()
+
+
+def analyze_ui(
+    query: str,
+    history_state: list[dict[str, Any]],
+    trust_hist_state: list[float],
+    geo_hist_state: list[float],
+    simulate_failure: bool,
+):
     q = (query or "").strip()
-    if not q:
+    th0 = list(trust_hist_state or [])
+    gh0 = list(geo_hist_state or [])
+
+    def _empty_pack(msg: str):
         return (
-            "⚠️ Please enter a query to analyze.",
-            _format_ranking_top3([]),
+            msg,
+            "",
+            _format_ranking_detailed([], {}),
             _metric_html("Trust Score", 0.0, "trust"),
             _metric_html("GEO Score", 0.0, "geo"),
+            _confidence_metric_html(0.0),
+            _breakdown_html(None, None),
             "<span class='tl-pill'>—</span>",
+            _trace_html([]),
             "_No explanation yet._",
-            _plot_trend([0.0, 0.0, 0.0, 0.0], "Trust Trend", "#22c55e"),
-            _plot_trend([0.0, 0.0, 0.0, 0.0], "GEO Trend", "#3b82f6"),
+            _plot_trend(th0, "Trust Trend", "#22c55e"),
+            _plot_trend(gh0, "GEO Trend", "#3b82f6"),
             render_history_table(history_state),
             history_state,
+            th0,
+            gh0,
+            _mode_badge_html("LLM Mode"),
+            {},
+            {},
+            {},
+            {},
+            {},
         )
 
-    time.sleep(0.25)  # demo realism, still < 1s
-    result = run_trustlens(q)
+    if not q:
+        return _empty_pack("⚠️ Please enter a query to analyze.")
+
+    u = gr.update()
+    result = simulate_agents(q, simulate_failure=bool(simulate_failure))
+
+    trace_full = list(result.get("trace") or [])
     ranking = list(result.get("ranking") or [])
+    notes_map = result.get("product_notes") if isinstance(result.get("product_notes"), dict) else {}
     trust_val = float(result.get("trust_score") or 0.0)
     geo_val = float(result.get("geo_score") or 0.0)
+    conf_int = int(result.get("confidence_score") or 0)
     explanation = str(result.get("explanation") or "").strip() or "_No explanation yet._"
+    debug = result.get("debug") or {}
+    notes = ""
+    try:
+        notes = str((debug.get("retrieval_output") or {}).get("notes") or "").strip()
+    except Exception:
+        notes = ""
+    is_fallback = notes == "Fallback" or bool(result.get("used_fallback"))
+    agent_failed = bool(result.get("agent_failed"))
+    failed_key = str(result.get("failed_agent_key") or "") or None
+    mode = _infer_mode_from_debug(debug)
 
-    trend = result.get("trend") or {}
-    trust_trend = list(trend.get("trust") or [])
-    geo_trend = list(trend.get("geo") or [])
+    th = list(th0)
+    gh = list(gh0)
+    if len(th) == 0:
+        br = random.Random(2026)
+        th = [br.uniform(0.55, 0.74) for _ in range(3)]
+        gh = [br.uniform(0.48, 0.68) for _ in range(3)]
+    th.append(trust_val)
+    gh.append(geo_val)
+    th, gh = th[-4:], gh[-4:]
 
     history = list(history_state or [])
     history.insert(0, {"query": q, "trust": trust_val, "geo": geo_val})
     history = history[:5]
 
-    return (
+    conf_emoji, conf_lbl = _interpret_confidence_pct(conf_int)
+    pill = (
+        f"<span class='tl-pill'>🏷️ {_pair_label(trust_val, geo_val)} · "
+        f"Confidence: {conf_lbl} {conf_emoji}</span>"
+    )
+
+    final_pack = (
         "",
-        _format_ranking_top3(ranking),
+        _alerts_html(is_fallback, agent_failed, failed_key),
+        _format_ranking_detailed(ranking, notes_map, is_fallback=is_fallback),
         _metric_html("Trust Score", trust_val, "trust"),
         _metric_html("GEO Score", geo_val, "geo"),
-        f"<span class='tl-pill'>🏷️ {_pair_label(trust_val, geo_val)}</span>",
+        _confidence_metric_html(float(conf_int)),
+        _breakdown_html(result.get("trust_breakdown"), result.get("geo_breakdown")),
+        pill,
+        _trace_html(trace_full),
         explanation,
-        _plot_trend(trust_trend, "Trust Trend", "#22c55e"),
-        _plot_trend(geo_trend, "GEO Trend", "#3b82f6"),
+        _plot_trend(th, "Trust Trend", "#22c55e"),
+        _plot_trend(gh, "GEO Trend", "#3b82f6"),
         render_history_table(history),
         history,
+        th,
+        gh,
+        _mode_badge_html(mode),
+        _pretty_json_payload(debug.get("retrieval_output")),
+        _pretty_json_payload(debug.get("ranking_raw_llm_output")),
+        _pretty_json_payload(debug.get("trust_calculation_steps")),
+        _pretty_json_payload(debug.get("geo_calculation_steps")),
+        _pretty_json_payload(debug.get("explanation_prompt_output")),
     )
+
+    yield (
+        "**Agents are working...** Simulated agents are executing step-by-step.",
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        _trace_html([]),
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+        u,
+    )
+
+    for i in range(len(trace_full)):
+        if i > 0:
+            time.sleep(random.uniform(0.5, 1.0))
+        partial = trace_full[: i + 1]
+        done = [str((t or {}).get("name") or "") for t in partial]
+        status = "**Agents are working...**\n\n" + "\n".join(f"- {html.escape(x)}" for x in done if x)
+        yield (
+            status,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            _trace_html(partial),
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+            u,
+        )
+
+    yield final_pack
 
 
 theme = gr.themes.Soft(
@@ -395,6 +923,8 @@ theme = gr.themes.Soft(
 
 with gr.Blocks(title=APP_TITLE) as demo:
     history_state = gr.State([])  # session-based history (last 5)
+    trust_hist_state = gr.State([])
+    geo_hist_state = gr.State([])
 
     with gr.Column(elem_classes=["tl-wrap"]):
         gr.Markdown(
@@ -402,6 +932,13 @@ with gr.Blocks(title=APP_TITLE) as demo:
 <div class="header">
   <h1>🚀 {APP_TITLE}</h1>
   <p><strong>{TAGLINE}</strong></p>
+  <p>{SUBTEXT}</p>
+  <div class="tl-demo-badge" title="No external APIs. This simulates CrewAI-style orchestration.">
+    <span title="No external APIs. This simulates CrewAI-style orchestration.">🧪 Demo Mode: Simulated Multi-Agent Execution</span>
+  </div>
+  <div class="tl-badges">
+    {''.join(f'<span class="tl-badge">{html.escape(b)}</span>' for b in BADGES)}
+  </div>
   <p>Mini analytics platform UI (simulated). No external API calls.</p>
 </div>
 """.strip()
@@ -409,6 +946,10 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
         with gr.Group(elem_classes=["tl-card"]):
             gr.Markdown("### 🔎 Input")
+            simulate_failure = gr.Checkbox(
+                label="⚠ Simulate Agent Failure",
+                value=False,
+            )
             with gr.Row(equal_height=True):
                 with gr.Column(scale=3, min_width=360):
                     query_in = gr.Textbox(
@@ -418,7 +959,9 @@ with gr.Blocks(title=APP_TITLE) as demo:
                         max_lines=4,
                     )
                 with gr.Column(scale=1, min_width=170):
-                    analyze_btn = gr.Button("Analyze", variant="primary")
+                    with gr.Row(equal_height=True):
+                        analyze_btn = gr.Button("Analyze", variant="primary")
+                        mode_badge = gr.HTML(value=_mode_badge_html("LLM Mode"))
 
             gr.Markdown("**Examples**")
             gr.Examples(
@@ -430,13 +973,27 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 inputs=[query_in],
                 label="",
             )
+            loading_panel = gr.HTML(
+                value=(
+                    "<div class='tl-loading'>"
+                    "<div class='tl-spinner'></div>"
+                    "<div>"
+                    "<div>Agents are working...</div>"
+                    "<div class='tl-loading-sub'>Simulated orchestration with staged trace updates.</div>"
+                    "</div>"
+                    "</div>"
+                ),
+                visible=False,
+            )
             status_md = gr.Markdown(value="")
+            show_debug = gr.Checkbox(label="Show debug info", value=False)
 
         with gr.Row(equal_height=True):
             with gr.Column():
                 with gr.Group(elem_classes=["tl-card"]):
                     gr.Markdown("### 📊 Ranking")
-                    ranked_out = gr.Markdown(value=_format_ranking_top3([]))
+                    fallback_banner = gr.HTML(value="")
+                    ranked_out = gr.Markdown(value=_format_ranking_detailed([], {}))
 
             with gr.Column():
                 with gr.Group(elem_classes=["tl-card"]):
@@ -444,20 +1001,40 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     with gr.Row():
                         trust_html = gr.HTML(value=_metric_html("Trust Score", 0.0, "trust"))
                         geo_html = gr.HTML(value=_metric_html("GEO Score", 0.0, "geo"))
+                        confidence_html = gr.HTML(value=_confidence_metric_html(0.0))
+                    breakdown_html = gr.HTML(value=_breakdown_html(None, None))
                     label_pill = gr.HTML(value="<span class='tl-pill'>—</span>")
+                with gr.Group(elem_classes=["tl-card"]):
+                    gr.Markdown("### 🧠 Agent Execution Trace")
+                    trace_html = gr.HTML(value=_trace_html([]))
 
             with gr.Column():
                 with gr.Group(elem_classes=["tl-card"]):
                     gr.Markdown("### 💡 Explanation")
                     explanation_out = gr.Markdown(value="_No explanation yet._")
 
+        with gr.Group(elem_classes=["tl-card"]):
+            gr.Markdown("### 🧩 Debug info")
+            gr.Markdown("Hidden by default to avoid clutter. Enable **Show debug info** above to view.", elem_classes=["tl-foot"])
+
+            with gr.Accordion("1. Retrieval Output", open=False, visible=False) as acc_retrieval:
+                dbg_retrieval = gr.JSON(value={})
+            with gr.Accordion("2. Ranking Raw LLM Output", open=False, visible=False) as acc_ranking_raw:
+                dbg_ranking_raw = gr.JSON(value={})
+            with gr.Accordion("3. Trust Calculation Steps", open=False, visible=False) as acc_trust_steps:
+                dbg_trust_steps = gr.JSON(value={})
+            with gr.Accordion("4. GEO Calculation Steps", open=False, visible=False) as acc_geo_steps:
+                dbg_geo_steps = gr.JSON(value={})
+            with gr.Accordion("5. Explanation Prompt + Output", open=False, visible=False) as acc_expl:
+                dbg_expl = gr.JSON(value={})
+
         gr.HTML("<div class='tl-divider'></div>")
 
         with gr.Group(elem_classes=["tl-card"]):
             gr.Markdown("### 🔥 Trends")
             with gr.Row():
-                trust_trend_plot = gr.Plot(value=_plot_trend([0.0, 0.0, 0.0, 0.0], "Trust Trend", "#22c55e"))
-                geo_trend_plot = gr.Plot(value=_plot_trend([0.0, 0.0, 0.0, 0.0], "GEO Trend", "#3b82f6"))
+                trust_trend_plot = gr.Plot(value=_plot_trend([], "Trust Trend", "#22c55e"))
+                geo_trend_plot = gr.Plot(value=_plot_trend([], "GEO Trend", "#3b82f6"))
 
         gr.HTML("<div class='tl-divider'></div>")
 
@@ -467,28 +1044,55 @@ with gr.Blocks(title=APP_TITLE) as demo:
             history_table = gr.HTML(value=render_history_table([]))
 
         gr.HTML("<hr />")
-        gr.Markdown("**Powered by AI (simulated)**  \nTrustLens AI demo layer — no external APIs, no heavy models.", elem_classes=["tl-foot"])
+        gr.Markdown(
+            "**Powered by Multi-Agent AI (CrewAI + RAG)**  \nDesigned for scalable AI decision intelligence systems",
+            elem_classes=["tl-foot"],
+        )
 
     (
-        analyze_btn.click(fn=begin_run, inputs=[query_in], outputs=[analyze_btn, status_md], queue=False)
+        analyze_btn.click(
+            fn=begin_run,
+            inputs=[query_in],
+            outputs=[analyze_btn, status_md, loading_panel],
+            queue=False,
+        )
         .then(
             fn=analyze_ui,
-            inputs=[query_in, history_state],
+            inputs=[query_in, history_state, trust_hist_state, geo_hist_state, simulate_failure],
             outputs=[
                 status_md,
+                fallback_banner,
                 ranked_out,
                 trust_html,
                 geo_html,
+                confidence_html,
+                breakdown_html,
                 label_pill,
+                trace_html,
                 explanation_out,
                 trust_trend_plot,
                 geo_trend_plot,
                 history_table,
                 history_state,
+                trust_hist_state,
+                geo_hist_state,
+                mode_badge,
+                dbg_retrieval,
+                dbg_ranking_raw,
+                dbg_trust_steps,
+                dbg_geo_steps,
+                dbg_expl,
             ],
             show_progress="full",
         )
-        .then(fn=end_run, outputs=[analyze_btn], queue=False)
+        .then(fn=end_run, outputs=[analyze_btn, loading_panel], queue=False)
+    )
+
+    show_debug.change(
+        fn=toggle_debug,
+        inputs=[show_debug],
+        outputs=[acc_retrieval, acc_ranking_raw, acc_trust_steps, acc_geo_steps, acc_expl],
+        queue=False,
     )
 
 
