@@ -65,30 +65,64 @@ CSS = """
 }
 .header h1 { color: white; margin: 0; font-size: 30px; font-weight: 800; letter-spacing: -0.02em; }
 .header p { color: #dbeafe; margin: 4px 0 0 0; }
+.header .markdown-body > p,
+.header .prose > p { color: #dbeafe; }
+.header .markdown-body > p strong,
+.header .prose > p strong { color: #ffffff; }
+.header .markdown-body > p em,
+.header .prose > p em { color: rgba(219, 234, 254, 0.92); }
 
-/* Native Gradio header tag buttons (HF-safe; no custom flex on badge strip) */
-#tl-header-tags {
+/* Capability tags: native Gradio buttons (avoids HF stripping HTML badge spans inside Markdown). */
+.tl-tag-row {
   margin-top: 10px;
+  margin-bottom: 2px;
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  gap: 8px !important;
+  width: 100% !important;
 }
-#tl-header-tags button {
-  border-radius: 999px !important;
-  background: linear-gradient(180deg, rgba(255,255,255,0.20), rgba(255,255,255,0.10)) !important;
-  border: 1px solid rgba(255,255,255,0.28) !important;
-  color: rgba(255,255,255,0.95) !important;
-  font-weight: 800 !important;
+/* Shrink each column/block to the button’s intrinsic width (no equal flex stretch). */
+.tl-tag-row > .form,
+.tl-tag-row > div {
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+}
+.gradio-container .tl-tag-row .tag-btn,
+.gradio-container .tl-tag-row .tag-btn.form {
+  width: fit-content !important;
+  min-width: 0 !important;
+}
+.gradio-container .tl-tag-row .tag-btn > button,
+.gradio-container .tl-tag-row .tag-btn button,
+.gradio-container .tl-tag-row button.tag-btn {
+  border-radius: 20px !important;
+  background: linear-gradient(135deg, rgba(255,255,255,0.22), rgba(255,255,255,0.08)) !important;
+  border: 1px solid rgba(255,255,255,0.30) !important;
+  padding: 4px 14px !important;
   font-size: 12px !important;
+  font-weight: 800 !important;
   letter-spacing: 0.01em !important;
-  padding: 6px 12px !important;
-  min-height: 0 !important;
+  color: rgba(255,255,255,0.95) !important;
+  cursor: default !important;
+  min-height: 30px !important;
   line-height: 1.25 !important;
   box-shadow: none !important;
-  cursor: default !important;
   opacity: 1 !important;
-  margin: 0 8px 8px 0 !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  white-space: normal !important;
+  text-align: center !important;
 }
-#tl-header-tags button:hover,
-#tl-header-tags button:active,
-#tl-header-tags button:focus {
+.gradio-container .tl-tag-row .tag-btn > button:hover,
+.gradio-container .tl-tag-row .tag-btn button:hover,
+.gradio-container .tl-tag-row button.tag-btn:hover,
+.gradio-container .tl-tag-row .tag-btn > button:active,
+.gradio-container .tl-tag-row .tag-btn button:active,
+.gradio-container .tl-tag-row button.tag-btn:active {
   transform: none !important;
   box-shadow: none !important;
 }
@@ -315,22 +349,6 @@ hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 18px 0;
   font-size: 12px;
   letter-spacing: 0.01em;
 }
-
-.tl-demo-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 8px 12px;
-  border-radius: 12px;
-  border: 1px solid rgba(99, 102, 241, 0.45);
-  background: rgba(99, 102, 241, 0.14);
-  color: rgba(255,255,255,0.95);
-  font-weight: 900;
-  font-size: 13px;
-  max-width: 100%;
-}
-.tl-demo-badge span[title] { cursor: help; border-bottom: 1px dotted rgba(255,255,255,0.35); }
 
 .tl-breakdown {
   margin-top: 10px;
@@ -935,7 +953,7 @@ theme = gr.themes.Soft(
     input_background_fill_dark="rgba(255,255,255,0.05)",
 )
 
-with gr.Blocks(title=APP_TITLE, css=CSS) as demo:
+with gr.Blocks(title=APP_TITLE, theme=theme, css=CSS) as demo:
     history_state = gr.State([])  # session-based history (last 5)
     trust_hist_state = gr.State([])
     geo_hist_state = gr.State([])
@@ -943,23 +961,17 @@ with gr.Blocks(title=APP_TITLE, css=CSS) as demo:
     with gr.Column(elem_classes=["tl-wrap"]):
         with gr.Column(elem_classes=["header"]):
             gr.Markdown(
-                f"""
-<h1>🚀 {APP_TITLE}</h1>
-<p><strong>{TAGLINE}</strong></p>
-<p>{SUBTEXT}</p>
-<div class="tl-demo-badge" title="No external APIs. This simulates CrewAI-style orchestration.">
-  <span title="No external APIs. This simulates CrewAI-style orchestration.">🧪 Demo Mode: Simulated Multi-Agent Execution</span>
-</div>
-<p>Mini analytics platform UI (simulated). No external API calls.</p>
-""".strip()
+                f"# 🚀 {APP_TITLE}\n\n"
+                f"**{TAGLINE}**\n\n"
+                f"{SUBTEXT}\n\n"
+                "**🧪 Demo Mode:** Simulated Multi-Agent Execution  \n"
+                "_No external APIs. This simulates CrewAI-style orchestration._"
             )
-            with gr.Row(equal_height=True, elem_id="tl-header-tags"):
-                for badge_label in BADGES:
-                    gr.Button(
-                        badge_label,
-                        interactive=False,
-                        elem_classes=["tag-btn"],
-                    )
+            with gr.Row(equal_height=True, elem_classes=["tl-tag-row"]):
+                for badge in BADGES:
+                    with gr.Column(scale=0, min_width=0):
+                        gr.Button(badge, interactive=False, elem_classes=["tag-btn"])
+            gr.Markdown("Mini analytics platform UI (simulated). No external API calls.")
 
         with gr.Group(elem_classes=["tl-card"]):
             gr.Markdown("### 🔎 Input")
@@ -1115,5 +1127,5 @@ with gr.Blocks(title=APP_TITLE, css=CSS) as demo:
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(theme=theme)
+    demo.launch()
 
